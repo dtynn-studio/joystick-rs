@@ -5,20 +5,26 @@ use windows::{
     core::{Error as wError, HSTRING, PCWSTR},
     w,
     Win32::{
+        Devices::HumanInterfaceDevice::{
+            HidP_GetButtonCaps, HidP_GetCaps, HidP_GetValueCaps, HidP_Input, HIDP_BUTTON_CAPS,
+            HIDP_CAPS, HIDP_VALUE_CAPS, HID_USAGE_GENERIC_GAMEPAD, HID_USAGE_GENERIC_JOYSTICK,
+            HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC,
+        },
         Foundation::{
-            GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+            GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM, LRESULT, SUCCESS, WPARAM,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::{
                 GetRawInputDeviceInfoW, GetRawInputDeviceList, RegisterRawInputDevices,
-                RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAW_INPUT_DEVICE_INFO_COMMAND, RIDEV_INPUTSINK,
-                RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA, RID_DEVICE_INFO,
-                RID_DEVICE_INFO_HID, RIM_TYPEHID,
+                RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAW_INPUT_DEVICE_INFO_COMMAND, RIDEV_DEVNOTIFY,
+                RIDEV_INPUTSINK, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA,
+                RID_DEVICE_INFO, RID_DEVICE_INFO_HID, RIM_TYPEHID,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, CW_USEDEFAULT,
-                HWND_MESSAGE, WNDCLASSEXW, WNDCLASS_STYLES,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, RegisterClassExW,
+                CW_USEDEFAULT, HWND_MESSAGE, MSG, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WNDCLASSEXW,
+                WNDCLASS_STYLES,
             },
         },
     },
@@ -27,10 +33,6 @@ use windows::{
 use crate::Result;
 
 const NULL: *const c_void = 0 as *const c_void;
-
-const US_USAGE_PAGE: u16 = 0x0001;
-const US_USAGE_ID_JOYSTICK: u16 = 0x0004;
-const US_USAGE_ID_XINPUT: u16 = 0x0005;
 
 const RAW_DEV_LIST_NUM: usize = 32;
 const FAIL: u32 = -1i32 as u32;
@@ -109,6 +111,8 @@ impl Manager {
                 return Err(get_last_err("get null from CreateWindowExW").into());
             }
 
+            println!("window {:?} constructed", hwnd);
+
             let mut mgr = Self { hwnd };
             mgr.register_devices(include_xbox)?;
 
@@ -121,15 +125,15 @@ impl Manager {
         // TODO: RIDEV_DEVNOTIFY
         let devices = [
             RAWINPUTDEVICE {
-                usUsagePage: US_USAGE_PAGE,
-                usUsage: US_USAGE_ID_JOYSTICK,
-                dwFlags: RIDEV_INPUTSINK,
+                usUsagePage: HID_USAGE_PAGE_GENERIC,
+                usUsage: HID_USAGE_GENERIC_JOYSTICK,
+                dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
                 hwndTarget: self.hwnd,
             },
             RAWINPUTDEVICE {
-                usUsagePage: US_USAGE_PAGE,
-                usUsage: US_USAGE_ID_XINPUT,
-                dwFlags: RIDEV_INPUTSINK,
+                usUsagePage: HID_USAGE_PAGE_GENERIC,
+                usUsage: HID_USAGE_GENERIC_GAMEPAD,
+                dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
                 hwndTarget: self.hwnd,
             },
         ];
@@ -199,6 +203,20 @@ impl Manager {
             Ok(joysticks)
         }
     }
+
+    pub fn on_message(&mut self) -> Result<()> {
+        unsafe {
+            let mut msg = MSG::default();
+            if GetMessageW(&mut msg, self.hwnd, 0, 0).as_bool() {
+                println!(
+                    "get msg: {}: {:?}, {:?}",
+                    msg.message, msg.wParam, msg.lParam
+                );
+            };
+        }
+
+        Ok(())
+    }
 }
 
 unsafe fn get_device_info<T>(
@@ -218,10 +236,24 @@ unsafe fn get_device_info<T>(
     }
 }
 
+unsafe fn get_device_info_size(hdl: HANDLE, cmd: RAW_INPUT_DEVICE_INFO_COMMAND) -> Result<usize> {
+    let mut size = 0u32;
+    match GetRawInputDeviceInfoW(hdl, cmd, None, &mut size) {
+        SUCCESS => Ok(size as usize),
+        other => Err(get_last_err(format!("unexpected ret {} for {:?}", other, cmd)).into()),
+    }
+}
+
+#[inline]
+fn allocate_buffer<T: Default + Clone>(cap: usize) -> Vec<T> {
+    let buf = vec![T::default(); cap];
+    buf
+}
+
 #[inline]
 fn is_hid_joystick(info: &RID_DEVICE_INFO_HID) -> bool {
-    info.usUsagePage == US_USAGE_PAGE
-        && (info.usUsage == US_USAGE_ID_JOYSTICK || info.usUsage == US_USAGE_ID_XINPUT)
+    info.usUsagePage == HID_USAGE_PAGE_GENERIC
+        && (info.usUsage == HID_USAGE_GENERIC_JOYSTICK || info.usUsage == HID_USAGE_GENERIC_GAMEPAD)
 }
 
 #[derive(Debug)]
@@ -257,6 +289,143 @@ impl Joystick {
         if !is_hid_joystick(&dev_info.Anonymous.hid) {
             return Ok(None);
         }
+
+        // get pre parsed data
+        let pre_data_size = get_device_info_size(dev.hDevice, RIDI_PREPARSEDDATA)?;
+        let mut pre_data_buf = allocate_buffer::<u8>(pre_data_size);
+        get_device_info(
+            dev.hDevice,
+            RIDI_PREPARSEDDATA,
+            pre_data_buf.as_mut_ptr(),
+            Some(pre_data_size),
+        )?;
+
+        let pre_data_buf_ptr = pre_data_buf.as_ptr() as isize;
+
+        let mut hidp_caps = HIDP_CAPS::default();
+        HidP_GetCaps(pre_data_buf_ptr, &mut hidp_caps)?;
+
+        println!("Caps: {:?}", hidp_caps);
+
+        let buttons = if hidp_caps.NumberInputButtonCaps > 0 {
+            let mut button_num = hidp_caps.NumberInputButtonCaps;
+            let mut buttons = allocate_buffer::<HIDP_BUTTON_CAPS>(button_num as usize);
+
+            HidP_GetButtonCaps(
+                HidP_Input,
+                buttons.as_mut_ptr(),
+                &mut button_num,
+                pre_data_buf_ptr,
+            )?;
+
+            println!(
+                "Buttons [{}, {}]",
+                buttons[0].Anonymous.Range.UsageMin, buttons[0].Anonymous.Range.UsageMax
+            );
+
+            buttons
+        } else {
+            Vec::new()
+        };
+
+        let values = if hidp_caps.NumberInputValueCaps > 0 {
+            let mut value_num = hidp_caps.NumberInputValueCaps;
+            let mut values = allocate_buffer::<HIDP_VALUE_CAPS>(value_num as usize);
+
+            HidP_GetValueCaps(
+                HidP_Input,
+                values.as_mut_ptr(),
+                &mut value_num,
+                pre_data_buf_ptr,
+            )?;
+
+            // see https://www.usb.org/document-library/hid-usage-tables-14
+            for val in values.iter() {
+                println!("Report Count: {}", val.ReportCount);
+                match (val.UsagePage, val.Anonymous.Range.UsageMin) {
+                    (HID_USAGE_PAGE_GENERIC, 0x30) => println!(
+                        "Value: XAxis {:?} {:?} [{}, {}] [{}, {}]",
+                        val.IsAbsolute,
+                        val.HasNull,
+                        val.LogicalMin,
+                        val.LogicalMax,
+                        val.PhysicalMin,
+                        val.PhysicalMax
+                    ),
+                    (HID_USAGE_PAGE_GENERIC, 0x31) => println!(
+                        "Value: YAxis {:?} {:?} [{}, {}] [{}, {}]",
+                        val.IsAbsolute,
+                        val.HasNull,
+                        val.LogicalMin,
+                        val.LogicalMax,
+                        val.PhysicalMin,
+                        val.PhysicalMax
+                    ),
+                    (HID_USAGE_PAGE_GENERIC, 0x32) => println!(
+                        "Value: ZAxis {:?} {:?} [{}, {}] [{}, {}]",
+                        val.IsAbsolute,
+                        val.HasNull,
+                        val.LogicalMin,
+                        val.LogicalMax,
+                        val.PhysicalMin,
+                        val.PhysicalMax
+                    ),
+                    (HID_USAGE_PAGE_GENERIC, 0x33) => println!(
+                        "Value: RXAxis {:?} {:?} [{}, {}] [{}, {}]",
+                        val.IsAbsolute,
+                        val.HasNull,
+                        val.LogicalMin,
+                        val.LogicalMax,
+                        val.PhysicalMin,
+                        val.PhysicalMax
+                    ),
+                    (HID_USAGE_PAGE_GENERIC, 0x34) => println!(
+                        "Value: RYAxis {:?} {:?} [{}, {}] [{}, {}]",
+                        val.IsAbsolute,
+                        val.HasNull,
+                        val.LogicalMin,
+                        val.LogicalMax,
+                        val.PhysicalMin,
+                        val.PhysicalMax
+                    ),
+                    (HID_USAGE_PAGE_GENERIC, 0x35) => println!(
+                        "Value: RZAxis {:?} {:?} [{}, {}] [{}, {}]",
+                        val.IsAbsolute,
+                        val.HasNull,
+                        val.LogicalMin,
+                        val.LogicalMax,
+                        val.PhysicalMin,
+                        val.PhysicalMax
+                    ),
+                    (HID_USAGE_PAGE_GENERIC, 0x36) => println!(
+                        "Value: Slider {:?} {:?} [{}, {}] [{}, {}]",
+                        val.IsAbsolute,
+                        val.HasNull,
+                        val.LogicalMin,
+                        val.LogicalMax,
+                        val.PhysicalMin,
+                        val.PhysicalMax
+                    ),
+                    (HID_USAGE_PAGE_GENERIC, 0x39) => println!(
+                        "Value: Hat {:?} {:?} [{}, {}] [{}, {}]",
+                        val.IsAbsolute,
+                        val.HasNull,
+                        val.LogicalMin,
+                        val.LogicalMax,
+                        val.PhysicalMin,
+                        val.PhysicalMax
+                    ),
+                    (usage_page, usage_id) if usage_page >= 0xff00 => {
+                        println!("Vendor Defined {} {}", usage_page, usage_id,)
+                    }
+                    other => println!("Unknown Value {:?}", other),
+                }
+            }
+
+            values
+        } else {
+            Vec::new()
+        };
 
         Ok(Some(Self {
             dev,
