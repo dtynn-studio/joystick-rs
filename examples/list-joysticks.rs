@@ -1,6 +1,8 @@
-use joystick_rs::{driver::rawinput::Manager, Result};
+use joystick_rs::{driver::rawinput::Manager, logging::init_from_env, Result};
 
 pub fn main() -> Result<()> {
+    init_from_env()?;
+
     let mut mgr = Manager::new(true)?;
     println!("devices constructed");
     let devices = mgr.list_devices()?;
