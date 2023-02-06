@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::ops::RangeInclusive;
 use std::thread::{spawn, JoinHandle};
 use std::time::SystemTime;
 
@@ -11,8 +13,10 @@ use windows::{
     Win32::{
         Devices::HumanInterfaceDevice::{
             HidP_GetButtonCaps, HidP_GetCaps, HidP_GetValueCaps, HidP_Input, HIDP_BUTTON_CAPS,
-            HIDP_CAPS, HIDP_VALUE_CAPS, HID_USAGE_GENERIC_GAMEPAD, HID_USAGE_GENERIC_JOYSTICK,
-            HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC,
+            HIDP_CAPS, HIDP_VALUE_CAPS, HID_USAGE_GENERIC_GAMEPAD, HID_USAGE_GENERIC_HATSWITCH,
+            HID_USAGE_GENERIC_JOYSTICK, HID_USAGE_GENERIC_RX, HID_USAGE_GENERIC_RY,
+            HID_USAGE_GENERIC_RZ, HID_USAGE_GENERIC_SLIDER, HID_USAGE_GENERIC_X,
+            HID_USAGE_GENERIC_Y, HID_USAGE_GENERIC_Z, HID_USAGE_PAGE_GENERIC,
         },
         Foundation::{
             GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM, LRESULT, SUCCESS, WPARAM,
@@ -34,11 +38,25 @@ use windows::{
     },
 };
 
-use crate::driver::{DeviceInfo, Event, Manager};
+use crate::driver::{AxisType, Manager};
 
 const FAIL: u32 = -1i32 as u32;
 
+const HID_AXIS_USAGES: [u16; 6] = [
+    HID_USAGE_GENERIC_X,
+    HID_USAGE_GENERIC_Y,
+    HID_USAGE_GENERIC_Z,
+    HID_USAGE_GENERIC_RX,
+    HID_USAGE_GENERIC_RY,
+    HID_USAGE_GENERIC_RZ,
+];
+
 type DevIdent = isize;
+pub type Value = i32;
+pub type ValueRange = RangeInclusive<Value>;
+type Event = crate::driver::Event<DevIdent, ValueRange>;
+type DeviceInfo = crate::driver::DeviceInfo<ValueRange>;
+type DeviceSpecs = crate::driver::DeviceSpecs<ValueRange>;
 
 #[inline]
 unsafe fn get_last_err() -> wError {
@@ -105,8 +123,29 @@ impl Config {
 }
 
 #[derive(Debug)]
+pub enum DeviceObjectIndex {
+    Button(usize),
+    Axis(usize),
+    Slider(usize),
+    Hat(usize),
+    Unknown(u16, u16),
+}
+
+type DevObjectsMapping = HashMap<u16, DeviceObjectIndex>;
+
+#[derive(Debug, Default)]
+struct DevInfo {
+    name: HSTRING,
+    buttons: usize,
+    axises: Vec<AxisType>,
+    sliders: usize,
+    hats: usize,
+    mapping: DevObjectsMapping,
+}
+
+#[derive(Debug)]
 pub struct Mgr {
-    rx: Receiver<Result<Event<DevIdent>>>,
+    rx: Receiver<Result<Event>>,
     hwnd: HWND,
     join: Option<JoinHandle<()>>,
 }
@@ -121,9 +160,11 @@ impl Drop for Mgr {
 }
 
 impl Manager for Mgr {
-    type DevIdent = DevIdent;
+    type DeviceIdent = DevIdent;
+    type Value = Value;
+    type ValueRange = ValueRange;
 
-    fn as_event_receiver(&self) -> &Receiver<Result<Event<Self::DevIdent>>> {
+    fn as_event_receiver(&self) -> &Receiver<Result<Event>> {
         &self.rx
     }
 }
@@ -210,23 +251,38 @@ unsafe fn register_devices(hwnd: HWND, typ: DeviceType) -> Result<()> {
     Ok(())
 }
 
-fn proc_input_message(wparam: WPARAM, lparam: LPARAM) -> Result<Event<DevIdent>> {
+fn proc_input_message(
+    deivces: &mut HashMap<isize, DevInfo>,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Result<Event> {
     unimplemented!()
 }
 
-unsafe fn proc_input_change_message(wparam: WPARAM, lparam: LPARAM) -> Result<Event<DevIdent>> {
+unsafe fn proc_input_change_message(
+    deivces: &mut HashMap<isize, DevInfo>,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Result<Event> {
     match wparam.0 as u32 {
         GIDC_ARRIVAL => {}
         GIDC_REMOVAL => return Ok(Event::DeviceDeattached(lparam.0)),
         other => return Err(anyhow!("unexpected wparam {}", other)),
     };
 
-    let dev = get_device(HANDLE(lparam.0)).context("get device")?;
+    let (info, specs) = get_device(HANDLE(lparam.0)).context("get device")?;
+    let dev_info = DeviceInfo {
+        name: info.name.to_string_lossy(),
+        specs,
+    };
 
-    Ok(Event::DeviceAttached(lparam.0, dev))
+    deivces.insert(lparam.0, info);
+
+    Ok(Event::DeviceAttached(lparam.0, dev_info))
 }
 
-unsafe fn get_device(dev_hdl: HANDLE) -> Result<DeviceInfo> {
+unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
+    let _span = warn_span!("device", hdl = ?dev_hdl).entered();
     let mut name_buf = [0u16; 1024];
     let name_buf_size = name_buf.len();
     let name_buf_used = sys_get_device_info(
@@ -237,7 +293,7 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<DeviceInfo> {
     )
     .context("get device name")?;
 
-    let name = HSTRING::from_wide(&name_buf[..name_buf_used.min(name_buf_size)])
+    let hname = HSTRING::from_wide(&name_buf[..name_buf_used.min(name_buf_size)])
         .context("construct device name string")?;
 
     let mut dev_info = RID_DEVICE_INFO {
@@ -246,7 +302,7 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<DeviceInfo> {
     };
 
     sys_get_device_info(dev_hdl, RIDI_DEVICEINFO, &mut dev_info, None)?;
-    if !is_hid_joystick(&dev_info.Anonymous.hid) {
+    if !is_hid_joystick(&dev_info) {
         return Err(anyhow!(
             "unexpected device type 0x{:x}(0x{:x}-0x{:x})",
             dev_info.dwType.0,
@@ -273,148 +329,144 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<DeviceInfo> {
     let mut hidp_caps = HIDP_CAPS::default();
     HidP_GetCaps(pre_data_buf_ptr, &mut hidp_caps).context("get device caps")?;
 
-    unimplemented!()
+    trace!("caps: {:?}", hidp_caps);
 
-    //         if dev.dwType != RIM_TYPEHID {
-    //             return Ok(None);
-    //         }
+    let mut info = DevInfo {
+        name: hname,
+        ..Default::default()
+    };
 
-    //         println!("Caps: {:?}", hidp_caps);
+    let mut axis_specs = Vec::new();
+    let mut slider_specs = Vec::new();
 
-    //         let buttons = if hidp_caps.NumberInputButtonCaps > 0 {
-    //             let mut button_num = hidp_caps.NumberInputButtonCaps;
-    //             let mut buttons = allocate_buffer::<HIDP_BUTTON_CAPS>(button_num as usize);
+    if hidp_caps.NumberInputButtonCaps > 0 {
+        let mut buttons_num = hidp_caps.NumberInputButtonCaps;
+        let mut buttons = allocate_buffer::<HIDP_BUTTON_CAPS>(buttons_num as usize);
 
-    //             HidP_GetButtonCaps(
-    //                 HidP_Input,
-    //                 buttons.as_mut_ptr(),
-    //                 &mut button_num,
-    //                 pre_data_buf_ptr,
-    //             )?;
+        HidP_GetButtonCaps(
+            HidP_Input,
+            buttons.as_mut_ptr(),
+            &mut buttons_num,
+            pre_data_buf_ptr,
+        )
+        .context("HidP_GetButtonCaps")?;
 
-    //             println!(
-    //                 "Buttons [{}, {}]",
-    //                 buttons[0].Anonymous.Range.UsageMin, buttons[0].Anonymous.Range.UsageMax
-    //             );
+        for cap in buttons {
+            if cap.IsRange.as_bool() {
+                for di in cap.Anonymous.Range.DataIndexMin..=cap.Anonymous.Range.DataIndexMax {
+                    if let Some(prev) = info
+                        .mapping
+                        .insert(di, DeviceObjectIndex::Button(info.buttons))
+                    {
+                        warn!(
+                            di,
+                            "found duplicate data index for button, prev: {:?}", prev
+                        );
+                    };
 
-    //             buttons
-    //         } else {
-    //             Vec::new()
-    //         };
+                    info.buttons += 1;
+                }
+            } else {
+                if let Some(prev) = info.mapping.insert(
+                    cap.Anonymous.NotRange.DataIndex,
+                    DeviceObjectIndex::Button(info.buttons),
+                ) {
+                    warn!(
+                        di = cap.Anonymous.NotRange.DataIndex,
+                        "found duplicate data index for button, prev: {:?}", prev
+                    );
+                }
 
-    //         let values = if hidp_caps.NumberInputValueCaps > 0 {
-    //             let mut value_num = hidp_caps.NumberInputValueCaps;
-    //             let mut values = allocate_buffer::<HIDP_VALUE_CAPS>(value_num as usize);
+                info.buttons += 1;
+            }
+        }
+    };
 
-    //             HidP_GetValueCaps(
-    //                 HidP_Input,
-    //                 values.as_mut_ptr(),
-    //                 &mut value_num,
-    //                 pre_data_buf_ptr,
-    //             )?;
+    if hidp_caps.NumberInputValueCaps > 0 {
+        let mut values_num = hidp_caps.NumberInputValueCaps;
+        let mut values = allocate_buffer::<HIDP_VALUE_CAPS>(values_num as usize);
 
-    //             // see https://www.usb.org/document-library/hid-usage-tables-14
-    //             for val in values.iter() {
-    //                 println!("Report Count: {}", val.ReportCount);
-    //                 match (val.UsagePage, val.Anonymous.Range.UsageMin) {
-    //                     (HID_USAGE_PAGE_GENERIC, 0x30) => println!(
-    //                         "Value: XAxis {:?} {:?} [{}, {}] [{}, {}]",
-    //                         val.IsAbsolute,
-    //                         val.HasNull,
-    //                         val.LogicalMin,
-    //                         val.LogicalMax,
-    //                         val.PhysicalMin,
-    //                         val.PhysicalMax
-    //                     ),
-    //                     (HID_USAGE_PAGE_GENERIC, 0x31) => println!(
-    //                         "Value: YAxis {:?} {:?} [{}, {}] [{}, {}]",
-    //                         val.IsAbsolute,
-    //                         val.HasNull,
-    //                         val.LogicalMin,
-    //                         val.LogicalMax,
-    //                         val.PhysicalMin,
-    //                         val.PhysicalMax
-    //                     ),
-    //                     (HID_USAGE_PAGE_GENERIC, 0x32) => println!(
-    //                         "Value: ZAxis {:?} {:?} [{}, {}] [{}, {}]",
-    //                         val.IsAbsolute,
-    //                         val.HasNull,
-    //                         val.LogicalMin,
-    //                         val.LogicalMax,
-    //                         val.PhysicalMin,
-    //                         val.PhysicalMax
-    //                     ),
-    //                     (HID_USAGE_PAGE_GENERIC, 0x33) => println!(
-    //                         "Value: RXAxis {:?} {:?} [{}, {}] [{}, {}]",
-    //                         val.IsAbsolute,
-    //                         val.HasNull,
-    //                         val.LogicalMin,
-    //                         val.LogicalMax,
-    //                         val.PhysicalMin,
-    //                         val.PhysicalMax
-    //                     ),
-    //                     (HID_USAGE_PAGE_GENERIC, 0x34) => println!(
-    //                         "Value: RYAxis {:?} {:?} [{}, {}] [{}, {}]",
-    //                         val.IsAbsolute,
-    //                         val.HasNull,
-    //                         val.LogicalMin,
-    //                         val.LogicalMax,
-    //                         val.PhysicalMin,
-    //                         val.PhysicalMax
-    //                     ),
-    //                     (HID_USAGE_PAGE_GENERIC, 0x35) => println!(
-    //                         "Value: RZAxis {:?} {:?} [{}, {}] [{}, {}]",
-    //                         val.IsAbsolute,
-    //                         val.HasNull,
-    //                         val.LogicalMin,
-    //                         val.LogicalMax,
-    //                         val.PhysicalMin,
-    //                         val.PhysicalMax
-    //                     ),
-    //                     (HID_USAGE_PAGE_GENERIC, 0x36) => println!(
-    //                         "Value: Slider {:?} {:?} [{}, {}] [{}, {}]",
-    //                         val.IsAbsolute,
-    //                         val.HasNull,
-    //                         val.LogicalMin,
-    //                         val.LogicalMax,
-    //                         val.PhysicalMin,
-    //                         val.PhysicalMax
-    //                     ),
-    //                     (HID_USAGE_PAGE_GENERIC, 0x39) => println!(
-    //                         "Value: Hat {:?} {:?} [{}, {}] [{}, {}]",
-    //                         val.IsAbsolute,
-    //                         val.HasNull,
-    //                         val.LogicalMin,
-    //                         val.LogicalMax,
-    //                         val.PhysicalMin,
-    //                         val.PhysicalMax
-    //                     ),
-    //                     (usage_page, usage_id) if usage_page >= 0xff00 => {
-    //                         println!("Vendor Defined {} {}", usage_page, usage_id,)
-    //                     }
-    //                     other => println!("Unknown Value {:?}", other),
-    //                 }
-    //             }
+        HidP_GetValueCaps(
+            HidP_Input,
+            values.as_mut_ptr(),
+            &mut values_num,
+            pre_data_buf_ptr,
+        )
+        .context("HidP_GetValueCaps")?;
 
-    //             values
-    //         } else {
-    //             Vec::new()
-    //         };
+        for cap in values {
+            let (di, usage) = if cap.IsRange.as_bool() {
+                (
+                    cap.Anonymous.Range.DataIndexMin,
+                    cap.Anonymous.Range.UsageMin,
+                )
+            } else {
+                (
+                    cap.Anonymous.NotRange.Usage,
+                    cap.Anonymous.NotRange.DataIndex,
+                )
+            };
 
-    //         Ok(Some(Self {
-    //             dev,
-    //             name,
-    //             info: dev_info.Anonymous.hid,
-    //         }))
+            let item = match (cap.UsagePage, usage) {
+                (HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_SLIDER) => {
+                    let idx = info.sliders;
+                    info.sliders += 1;
+                    slider_specs.push(cap.LogicalMin..=cap.LogicalMax);
+                    DeviceObjectIndex::Slider(idx)
+                }
+
+                (HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_HATSWITCH) => {
+                    let idx = info.hats;
+                    info.hats += 1;
+                    DeviceObjectIndex::Hat(idx)
+                }
+
+                (HID_USAGE_PAGE_GENERIC, usage) if HID_AXIS_USAGES.contains(&usage) => {
+                    let atyp = match usage {
+                        HID_USAGE_GENERIC_X => AxisType::X,
+                        HID_USAGE_GENERIC_Y => AxisType::Y,
+                        HID_USAGE_GENERIC_Z => AxisType::Z,
+                        HID_USAGE_GENERIC_RX => AxisType::RX,
+                        HID_USAGE_GENERIC_RY => AxisType::RY,
+                        HID_USAGE_GENERIC_RZ => AxisType::RZ,
+                        _ => unreachable!("unexpected usage id {} for axis", usage),
+                    };
+
+                    let idx = info.axises.len();
+                    info.axises.push(atyp);
+                    axis_specs.push((atyp, cap.LogicalMin..=cap.LogicalMax));
+                    DeviceObjectIndex::Axis(idx)
+                }
+
+                (upage, uid) => DeviceObjectIndex::Unknown(upage, uid),
+            };
+
+            if let Some(prev) = info.mapping.insert(di, item) {
+                warn!(
+                    di,
+                    "found duplicate data index for value(0x{:04x}-0x{:04x}), prev: {:?}",
+                    cap.UsagePage,
+                    usage,
+                    prev
+                );
+            };
+        }
+    };
+
+    let specs = DeviceSpecs {
+        button_count: info.buttons,
+        axis: axis_specs,
+        sliders: slider_specs,
+        hats_count: info.hats,
+    };
+
+    Ok((info, specs))
 }
 
-unsafe fn start_event_loop(
-    hwnd: HWND,
-    cfg: Config,
-    tx: &Sender<Result<Event<DevIdent>>>,
-) -> Result<()> {
+unsafe fn start_event_loop(hwnd: HWND, cfg: Config, tx: &Sender<Result<Event>>) -> Result<()> {
     register_devices(hwnd, cfg.dev_type)?;
 
+    let mut devices = HashMap::new();
     loop {
         let mut msg = MSG::default();
         match GetMessageW(&mut msg, hwnd, WM_INPUT_DEVICE_CHANGE, WM_INPUT).0 {
@@ -435,9 +487,12 @@ unsafe fn start_event_loop(
         trace!("received");
 
         let res = match msg.message {
-            WM_INPUT => proc_input_message(msg.wParam, msg.lParam).context("proc input msg"),
+            WM_INPUT => {
+                proc_input_message(&mut devices, msg.wParam, msg.lParam).context("proc input msg")
+            }
             WM_INPUT_DEVICE_CHANGE => {
-                proc_input_change_message(msg.wParam, msg.lParam).context("proc input change msg")
+                proc_input_change_message(&mut devices, msg.wParam, msg.lParam)
+                    .context("proc input change msg")
             }
             _other => {
                 warn!("unexpected msg type");
@@ -501,9 +556,11 @@ fn allocate_buffer<T: Default + Clone>(cap: usize) -> Vec<T> {
 }
 
 #[inline]
-fn is_hid_joystick(info: &RID_DEVICE_INFO_HID) -> bool {
-    info.usUsagePage == HID_USAGE_PAGE_GENERIC
-        && (info.usUsage == HID_USAGE_GENERIC_JOYSTICK || info.usUsage == HID_USAGE_GENERIC_GAMEPAD)
+unsafe fn is_hid_joystick(info: &RID_DEVICE_INFO) -> bool {
+    info.dwType == RIM_TYPEHID
+        && info.Anonymous.hid.usUsagePage == HID_USAGE_PAGE_GENERIC
+        && (info.Anonymous.hid.usUsage == HID_USAGE_GENERIC_JOYSTICK
+            || info.Anonymous.hid.usUsage == HID_USAGE_GENERIC_GAMEPAD)
 }
 
 // impl Manager {
