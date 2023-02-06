@@ -264,9 +264,18 @@ unsafe fn proc_input_change_message(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Result<Event> {
+    let _span = warn_span!("input change", hdl = lparam.0).entered();
     match wparam.0 as u32 {
         GIDC_ARRIVAL => {}
-        GIDC_REMOVAL => return Ok(Event::DeviceDeattached(lparam.0)),
+        GIDC_REMOVAL => {
+            return {
+                if deivces.remove(&lparam.0).is_none() {
+                    warn!("no device found on removal");
+                }
+
+                Ok(Event::DeviceDeattached(lparam.0))
+            }
+        }
         other => return Err(anyhow!("unexpected wparam {}", other)),
     };
 
@@ -282,7 +291,6 @@ unsafe fn proc_input_change_message(
 }
 
 unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
-    let _span = warn_span!("device", hdl = ?dev_hdl).entered();
     let mut name_buf = [0u16; 1024];
     let name_buf_size = name_buf.len();
     let name_buf_used = sys_get_device_info(
