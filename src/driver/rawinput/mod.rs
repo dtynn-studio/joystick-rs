@@ -18,21 +18,19 @@ use windows::{
             HID_USAGE_GENERIC_RZ, HID_USAGE_GENERIC_SLIDER, HID_USAGE_GENERIC_X,
             HID_USAGE_GENERIC_Y, HID_USAGE_GENERIC_Z, HID_USAGE_PAGE_GENERIC,
         },
-        Foundation::{
-            GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM, LRESULT, SUCCESS, WPARAM,
-        },
+        Foundation::{HANDLE, HWND, LPARAM, LRESULT, SUCCESS, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::{
-                GetRawInputDeviceInfoW, GetRawInputDeviceList, RegisterRawInputDevices,
-                RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAW_INPUT_DEVICE_INFO_COMMAND, RIDEV_DEVNOTIFY,
-                RIDEV_INPUTSINK, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA,
-                RID_DEVICE_INFO, RID_DEVICE_INFO_HID, RIM_TYPEHID,
+                GetRawInputDeviceInfoW, RegisterRawInputDevices, RAWINPUTDEVICE,
+                RAW_INPUT_DEVICE_INFO_COMMAND, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDI_DEVICEINFO,
+                RIDI_DEVICENAME, RIDI_PREPARSEDDATA, RID_DEVICE_INFO, RIM_TYPEHID,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, RegisterClassExW,
-                CW_USEDEFAULT, GIDC_ARRIVAL, GIDC_REMOVAL, HWND_MESSAGE, MSG, WM_INPUT,
-                WM_INPUT_DEVICE_CHANGE, WNDCLASSEXW, WNDCLASS_STYLES,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, PostMessageW,
+                RegisterClassExW, CW_USEDEFAULT, GIDC_ARRIVAL, GIDC_REMOVAL, HWND_MESSAGE, MSG,
+                RIM_INPUT, RIM_INPUTSINK, WM_CLOSE, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WNDCLASSEXW,
+                WNDCLASS_STYLES,
             },
         },
     },
@@ -70,6 +68,7 @@ unsafe extern "system" fn window_proc_sys(
     lparam: LPARAM,
 ) -> LRESULT {
     trace!(?hwnd, msg, ?wparam, ?lparam, "recv window message");
+
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
@@ -94,16 +93,28 @@ pub struct Config {
 
 impl Config {
     pub fn start(self) -> Result<Mgr> {
-        unsafe {
-            let hwnd = setup_message_window()?;
-            let (tx, rx) = match self.event_buf_size {
-                Some(size) => bounded(size),
-                None => unbounded(),
-            };
+        let (hwnd_tx, hwnd_rx) = bounded(1);
+        let (tx, rx) = match self.event_buf_size {
+            Some(size) => bounded(size),
+            None => unbounded(),
+        };
 
+        unsafe {
             let join = spawn(move || {
+                let hwnd = match setup_message_window() {
+                    Ok(h) => {
+                        _ = hwnd_tx.send(Ok(h));
+                        h
+                    }
+
+                    err @ Err(_) => {
+                        _ = hwnd_tx.send(err);
+                        return;
+                    }
+                };
+
                 let tx = tx;
-                let _span = warn_span!("event loop").entered();
+                let _span = warn_span!("event loop", ?hwnd).entered();
                 debug!("start");
                 if let Err(e) = start_event_loop(hwnd, self, &tx) {
                     _ = tx.send(Err(e));
@@ -111,10 +122,14 @@ impl Config {
                 debug!("stop");
             });
 
+            let hwnd = hwnd_rx
+                .recv()
+                .context("get hwnd from spawned thread")?
+                .context("construct hwnd")?;
+
             let notifier = Mgr {
                 rx,
-                hwnd,
-                join: Some(join),
+                ctx: Some((hwnd, join)),
             };
 
             Ok(notifier)
@@ -122,13 +137,20 @@ impl Config {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum DeviceObjectIndex {
     Button(usize),
     Axis(usize),
     Slider(usize),
     Hat(usize),
     Unknown(u16, u16),
+}
+
+impl DeviceObjectIndex {
+    #[inline]
+    fn is_unknown(&self) -> bool {
+        matches!(self, DeviceObjectIndex::Unknown(_, _))
+    }
 }
 
 type DevObjectsMapping = HashMap<u16, DeviceObjectIndex>;
@@ -143,19 +165,44 @@ struct DevInfo {
     mapping: DevObjectsMapping,
 }
 
+impl DevInfo {
+    fn replace_mapping(&mut self, data_idx: u16, obj_idx: DeviceObjectIndex) {
+        let new_is_unknown = obj_idx.is_unknown();
+        if let Some(prev) = self.mapping.insert(data_idx, obj_idx) {
+            if new_is_unknown && prev.is_unknown() {
+                trace!(di=data_idx, ?prev, next = ?obj_idx, "found duplicate data index");
+            } else {
+                warn!(di=data_idx, ?prev, next = ?obj_idx, "found duplicate data index");
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Mgr {
     rx: Receiver<Result<Event>>,
-    hwnd: HWND,
-    join: Option<JoinHandle<()>>,
+    ctx: Option<(HWND, JoinHandle<()>)>,
+}
+
+impl Mgr {
+    fn shutdown(&mut self) -> Result<()> {
+        if let Some((hwnd, join)) = self.ctx.take() {
+            unsafe {
+                if !PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).as_bool() {
+                    warn!("failed to destory window: {:?}", get_last_err());
+                };
+            }
+
+            _ = join.join();
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for Mgr {
     fn drop(&mut self) {
-        unsafe { DestroyWindow(self.hwnd) };
-        if let Some(join) = self.join.take() {
-            _ = join.join();
-        }
+        _ = self.shutdown();
     }
 }
 
@@ -166,6 +213,10 @@ impl Manager for Mgr {
 
     fn as_event_receiver(&self) -> &Receiver<Result<Event>> {
         &self.rx
+    }
+
+    fn close(mut self) -> Result<()> {
+        self.shutdown()
     }
 }
 
@@ -248,15 +299,29 @@ unsafe fn register_devices(hwnd: HWND, typ: DeviceType) -> Result<()> {
     .ok()
     .context("RegisterRawInputDevices")?;
 
+    trace!(devs=?typ,"registered");
+
     Ok(())
 }
 
 fn proc_input_message(
-    deivces: &mut HashMap<isize, DevInfo>,
+    deivces: &HashMap<isize, DevInfo>,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Result<Event> {
-    unimplemented!()
+    match wparam.0 as u32 {
+        RIM_INPUT => Ok(Event::DeviceState {
+            ident: lparam.0,
+            is_sink: false,
+        }),
+
+        RIM_INPUTSINK => Ok(Event::DeviceState {
+            ident: lparam.0,
+            is_sink: true,
+        }),
+
+        _other => Err(anyhow!("unexpected wparam {:?} for input message", wparam)),
+    }
 }
 
 unsafe fn proc_input_change_message(
@@ -337,7 +402,7 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
     let mut hidp_caps = HIDP_CAPS::default();
     HidP_GetCaps(pre_data_buf_ptr, &mut hidp_caps).context("get device caps")?;
 
-    trace!("caps: {:?}", hidp_caps);
+    debug!("caps: {:?}", hidp_caps);
 
     let mut info = DevInfo {
         name: hname,
@@ -361,30 +426,27 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
 
         for cap in buttons {
             if cap.IsRange.as_bool() {
-                for di in cap.Anonymous.Range.DataIndexMin..=cap.Anonymous.Range.DataIndexMax {
-                    if let Some(prev) = info
-                        .mapping
-                        .insert(di, DeviceObjectIndex::Button(info.buttons))
-                    {
-                        warn!(
-                            di,
-                            "found duplicate data index for button, prev: {:?}", prev
-                        );
-                    };
+                trace!(
+                    di_range=?cap.Anonymous.Range.DataIndexMin..=cap.Anonymous.Range.DataIndexMax,
+                    usage_range=?cap.Anonymous.Range.UsageMin..=cap.Anonymous.Range.UsageMax,
+                    "ranged button cap",
+                );
 
+                for di in cap.Anonymous.Range.DataIndexMin..=cap.Anonymous.Range.DataIndexMax {
+                    info.replace_mapping(di, DeviceObjectIndex::Button(info.buttons));
                     info.buttons += 1;
                 }
             } else {
-                if let Some(prev) = info.mapping.insert(
+                trace!(
+                    di = cap.Anonymous.NotRange.DataIndex,
+                    usage = cap.Anonymous.NotRange.Usage,
+                    "individual button cap",
+                );
+
+                info.replace_mapping(
                     cap.Anonymous.NotRange.DataIndex,
                     DeviceObjectIndex::Button(info.buttons),
-                ) {
-                    warn!(
-                        di = cap.Anonymous.NotRange.DataIndex,
-                        "found duplicate data index for button, prev: {:?}", prev
-                    );
-                }
-
+                );
                 info.buttons += 1;
             }
         }
@@ -410,8 +472,8 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
                 )
             } else {
                 (
-                    cap.Anonymous.NotRange.Usage,
                     cap.Anonymous.NotRange.DataIndex,
+                    cap.Anonymous.NotRange.Usage,
                 )
             };
 
@@ -424,6 +486,14 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
                 }
 
                 (HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_HATSWITCH) => {
+                    if !(cap.LogicalMin == 0 && cap.LogicalMax == 7) {
+                        warn!(
+                            min = cap.LogicalMin,
+                            max = cap.LogicalMax,
+                            "unexpected value range for hat"
+                        );
+                    }
+
                     let idx = info.hats;
                     info.hats += 1;
                     DeviceObjectIndex::Hat(idx)
@@ -440,24 +510,23 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
                         _ => unreachable!("unexpected usage id {} for axis", usage),
                     };
 
+                    let (mut vmin, mut vmax) = (cap.LogicalMin, cap.LogicalMax);
+                    if vmin == 0 && vmax == -1 {
+                        vmin = 0;
+                        vmax = u16::MAX as i32;
+                    }
+
                     let idx = info.axises.len();
                     info.axises.push(atyp);
-                    axis_specs.push((atyp, cap.LogicalMin..=cap.LogicalMax));
+                    axis_specs.push((atyp, vmin..=vmax));
                     DeviceObjectIndex::Axis(idx)
                 }
 
                 (upage, uid) => DeviceObjectIndex::Unknown(upage, uid),
             };
 
-            if let Some(prev) = info.mapping.insert(di, item) {
-                warn!(
-                    di,
-                    "found duplicate data index for value(0x{:04x}-0x{:04x}), prev: {:?}",
-                    cap.UsagePage,
-                    usage,
-                    prev
-                );
-            };
+            trace!(di, cap.UsagePage, usage, ?item, "value cap");
+            info.replace_mapping(di, item);
         }
     };
 
@@ -476,8 +545,9 @@ unsafe fn start_event_loop(hwnd: HWND, cfg: Config, tx: &Sender<Result<Event>>) 
 
     let mut devices = HashMap::new();
     loop {
+        trace!("waiting for message");
         let mut msg = MSG::default();
-        match GetMessageW(&mut msg, hwnd, WM_INPUT_DEVICE_CHANGE, WM_INPUT).0 {
+        match GetMessageW(&mut msg, hwnd, 0, WM_INPUT).0 {
             0 => return Ok(()),
             -1 => return Err(get_last_err()).context("GetMessageW"),
             code @ i32::MIN..=-2 => {
@@ -495,8 +565,15 @@ unsafe fn start_event_loop(hwnd: HWND, cfg: Config, tx: &Sender<Result<Event>>) 
         trace!("received");
 
         let res = match msg.message {
+            WM_CLOSE => {
+                if !DestroyWindow(hwnd).as_bool() {
+                    warn!("destory window: {:?}", get_last_err());
+                }
+                return Ok(());
+            }
+
             WM_INPUT => {
-                proc_input_message(&mut devices, msg.wParam, msg.lParam).context("proc input msg")
+                proc_input_message(&devices, msg.wParam, msg.lParam).context("proc input msg")
             }
             WM_INPUT_DEVICE_CHANGE => {
                 proc_input_change_message(&mut devices, msg.wParam, msg.lParam)

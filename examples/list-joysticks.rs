@@ -1,9 +1,10 @@
 use anyhow::Result;
+use tracing::info;
 
 use joystick_rs::{
     driver::{
         rawinput::{Config, DeviceType},
-        Manager,
+        Event, Manager,
     },
     logging::init_from_env,
 };
@@ -17,15 +18,27 @@ pub fn main() -> Result<()> {
     };
 
     let mgr = cfg.start()?;
-    println!("devices constructed");
+    info!("devices constructed");
 
     let rx = mgr.as_event_receiver();
 
-    for _ in 0..5 {
-        println!("waiting for incoming msg:");
-        let evt = rx.recv()??;
-        println!("get event: {:?}", evt);
+    while let Ok(evt) = rx.recv()? {
+        match evt {
+            Event::DeviceAttached(id, info) => {
+                info!("device {} attached: {:?}", id, info);
+            }
+
+            Event::DeviceDeattached(id) => {
+                info!("device {} deattached", id);
+                break;
+            }
+
+            _ => {}
+        }
     }
+
+    _ = mgr.close();
+
     println!("done");
 
     Ok(())

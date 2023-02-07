@@ -11,12 +11,15 @@ pub trait Manager {
     type ValueRange: RangeBounds<Self::Value>;
 
     fn as_event_receiver(&self) -> &Receiver<Result<Event<Self::DeviceIdent, Self::ValueRange>>>;
+
+    fn close(self) -> Result<()>;
 }
 
 #[derive(Debug)]
 pub enum Event<DI, VR> {
     DeviceAttached(DI, DeviceInfo<VR>),
     DeviceDeattached(DI),
+    DeviceState { ident: DI, is_sink: bool },
 }
 
 #[derive(Debug)]
