@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 use joystick_rs::{
     driver::{
@@ -21,6 +21,7 @@ pub fn main() -> Result<()> {
     info!("devices constructed");
 
     let rx = mgr.as_event_receiver();
+    let mut state_count = 0;
 
     while let Ok(evt) = rx.recv()? {
         match evt {
@@ -33,13 +34,34 @@ pub fn main() -> Result<()> {
                 break;
             }
 
-            _ => {}
+            Event::DeviceState {
+                ident,
+                is_sink,
+                states,
+            } => {
+                if state_count % 100 == 0 {
+                    info!(
+                        ident,
+                        is_sink,
+                        ?states,
+                        received = state_count,
+                        "state event"
+                    );
+                }
+
+                state_count += 1;
+            }
+
+            Event::Warning(e) | Event::Interuption(e) => {
+                warn!("err received: {:?}", e);
+                break;
+            }
         }
     }
 
     _ = mgr.close();
 
-    println!("done");
+    info!("done");
 
     Ok(())
 }

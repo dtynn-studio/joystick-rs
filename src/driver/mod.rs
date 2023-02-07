@@ -1,6 +1,6 @@
 use std::ops::RangeBounds;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use crossbeam_channel::Receiver;
 
 pub mod rawinput;
@@ -10,16 +10,24 @@ pub trait Manager {
     type Value;
     type ValueRange: RangeBounds<Self::Value>;
 
-    fn as_event_receiver(&self) -> &Receiver<Result<Event<Self::DeviceIdent, Self::ValueRange>>>;
+    fn as_event_receiver(
+        &self,
+    ) -> &Receiver<Result<Event<Self::DeviceIdent, Self::Value, Self::ValueRange>>>;
 
     fn close(self) -> Result<()>;
 }
 
 #[derive(Debug)]
-pub enum Event<DI, VR> {
+pub enum Event<DI, V, VR> {
     DeviceAttached(DI, DeviceInfo<VR>),
     DeviceDeattached(DI),
-    DeviceState { ident: DI, is_sink: bool },
+    DeviceState {
+        ident: DI,
+        is_sink: bool,
+        states: DeviceObjectStates<V>,
+    },
+    Warning(Error),
+    Interuption(Error),
 }
 
 #[derive(Debug)]
@@ -39,8 +47,8 @@ pub struct DeviceSpecs<VR> {
 #[derive(Debug)]
 pub struct DeviceObjectStates<V> {
     pub buttons: Vec<ButtonState>,
-    pub axis: Vec<V>,
-    pub sliders: Vec<V>,
+    pub axis: Vec<Option<V>>,
+    pub sliders: Vec<Option<V>>,
     pub hats: Vec<HatState>,
 }
 
@@ -55,13 +63,19 @@ pub enum AxisType {
 }
 
 #[repr(u8)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ButtonState {
     Pressed = 1,
     Releaed = 0,
 }
 
-#[derive(Debug)]
+impl Default for ButtonState {
+    fn default() -> Self {
+        Self::Releaed
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum HatState {
     Null,
     Up,
@@ -72,4 +86,10 @@ pub enum HatState {
     UpRight,
     DownLeft,
     DownRight,
+}
+
+impl Default for HatState {
+    fn default() -> Self {
+        Self::Null
+    }
 }

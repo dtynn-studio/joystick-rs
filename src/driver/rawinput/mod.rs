@@ -12,19 +12,20 @@ use windows::{
     core::{Error as wError, HSTRING, PCWSTR},
     Win32::{
         Devices::HumanInterfaceDevice::{
-            HidP_GetButtonCaps, HidP_GetCaps, HidP_GetValueCaps, HidP_Input, HIDP_BUTTON_CAPS,
-            HIDP_CAPS, HIDP_VALUE_CAPS, HID_USAGE_GENERIC_GAMEPAD, HID_USAGE_GENERIC_HATSWITCH,
-            HID_USAGE_GENERIC_JOYSTICK, HID_USAGE_GENERIC_RX, HID_USAGE_GENERIC_RY,
-            HID_USAGE_GENERIC_RZ, HID_USAGE_GENERIC_SLIDER, HID_USAGE_GENERIC_X,
-            HID_USAGE_GENERIC_Y, HID_USAGE_GENERIC_Z, HID_USAGE_PAGE_GENERIC,
+            HidP_GetButtonCaps, HidP_GetCaps, HidP_GetData, HidP_GetValueCaps, HidP_Input,
+            HIDP_BUTTON_CAPS, HIDP_CAPS, HIDP_DATA, HIDP_VALUE_CAPS, HID_USAGE_GENERIC_GAMEPAD,
+            HID_USAGE_GENERIC_HATSWITCH, HID_USAGE_GENERIC_JOYSTICK, HID_USAGE_GENERIC_RX,
+            HID_USAGE_GENERIC_RY, HID_USAGE_GENERIC_RZ, HID_USAGE_GENERIC_SLIDER,
+            HID_USAGE_GENERIC_X, HID_USAGE_GENERIC_Y, HID_USAGE_GENERIC_Z, HID_USAGE_PAGE_GENERIC,
         },
         Foundation::{HANDLE, HWND, LPARAM, LRESULT, SUCCESS, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::{
-                GetRawInputDeviceInfoW, RegisterRawInputDevices, RAWINPUTDEVICE,
-                RAW_INPUT_DEVICE_INFO_COMMAND, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDI_DEVICEINFO,
-                RIDI_DEVICENAME, RIDI_PREPARSEDDATA, RID_DEVICE_INFO, RIM_TYPEHID,
+                GetRawInputData, GetRawInputDeviceInfoW, RegisterRawInputDevices, HRAWINPUT,
+                RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAW_INPUT_DEVICE_INFO_COMMAND,
+                RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDI_DEVICEINFO, RIDI_DEVICENAME,
+                RIDI_PREPARSEDDATA, RID_DEVICE_INFO, RID_INPUT, RIM_TYPEHID,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, PostMessageW,
@@ -36,7 +37,7 @@ use windows::{
     },
 };
 
-use crate::driver::{AxisType, Manager};
+use crate::driver::{AxisType, ButtonState, HatState, Manager};
 
 const FAIL: u32 = -1i32 as u32;
 
@@ -52,9 +53,10 @@ const HID_AXIS_USAGES: [u16; 6] = [
 type DevIdent = isize;
 pub type Value = i32;
 pub type ValueRange = RangeInclusive<Value>;
-type Event = crate::driver::Event<DevIdent, ValueRange>;
+type Event = crate::driver::Event<DevIdent, Value, ValueRange>;
 type DeviceInfo = crate::driver::DeviceInfo<ValueRange>;
 type DeviceSpecs = crate::driver::DeviceSpecs<ValueRange>;
+type DeviceObjectStates = crate::driver::DeviceObjectStates<Value>;
 
 #[inline]
 unsafe fn get_last_err() -> wError {
@@ -155,9 +157,12 @@ impl DeviceObjectIndex {
 
 type DevObjectsMapping = HashMap<u16, DeviceObjectIndex>;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DevInfo {
     name: HSTRING,
+    pre_parsed_data: Vec<u8>,
+    // max_data_count: u32,
+    // hidp_caps: HIDP_CAPS,
     buttons: usize,
     axises: Vec<AxisType>,
     sliders: usize,
@@ -304,24 +309,169 @@ unsafe fn register_devices(hwnd: HWND, typ: DeviceType) -> Result<()> {
     Ok(())
 }
 
-fn proc_input_message(
-    deivces: &HashMap<isize, DevInfo>,
+unsafe fn proc_input_message(
+    devices: &HashMap<isize, DevInfo>,
+    hwnd: HWND,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Result<Event> {
-    match wparam.0 as u32 {
-        RIM_INPUT => Ok(Event::DeviceState {
-            ident: lparam.0,
-            is_sink: false,
-        }),
+    let is_sink = match wparam.0 as u32 {
+        RIM_INPUT => false,
 
-        RIM_INPUTSINK => Ok(Event::DeviceState {
-            ident: lparam.0,
-            is_sink: true,
-        }),
+        RIM_INPUTSINK => true,
 
-        _other => Err(anyhow!("unexpected wparam {:?} for input message", wparam)),
+        _other => return Err(anyhow!("unexpected wparam {:?} for input message", wparam)),
+    };
+
+    let res = fetch_input_data(devices, lparam);
+
+    if !is_sink {
+        // TODO: handle the result?
+        DefWindowProcW(hwnd, WM_INPUT, wparam, lparam);
     }
+
+    res.map(|(hdl, states)| Event::DeviceState {
+        ident: hdl,
+        is_sink,
+        states,
+    })
+}
+
+unsafe fn get_raw_input_data(lparam: LPARAM) -> Result<RAWINPUT> {
+    let mut raw_data_size = 0u32;
+    if GetRawInputData(
+        HRAWINPUT(lparam.0),
+        RID_INPUT,
+        None,
+        &mut raw_data_size,
+        size_of::<RAWINPUTHEADER>() as u32,
+    ) != 0
+    {
+        return Err(get_last_err()).context("get raw data size by calling GetRawInputData");
+    };
+
+    let mut raw_data = RAWINPUT::default();
+    if GetRawInputData(
+        HRAWINPUT(lparam.0),
+        RID_INPUT,
+        Some(&mut raw_data as *mut RAWINPUT as *mut c_void),
+        &mut raw_data_size,
+        size_of::<RAWINPUTHEADER>() as u32,
+    ) == FAIL
+    {
+        return Err(get_last_err()).context("GetRawInputData");
+    };
+
+    Ok(raw_data)
+}
+
+unsafe fn fetch_input_data(
+    devices: &HashMap<isize, DevInfo>,
+    lparam: LPARAM,
+) -> Result<(isize, DeviceObjectStates)> {
+    let mut raw_data = get_raw_input_data(lparam)?;
+
+    if raw_data.header.dwType != RIM_TYPEHID.0 {
+        return Err(anyhow!(
+            "unexpected dwType {} in RAWINPUT.header",
+            raw_data.header.dwType
+        ));
+    }
+
+    let hdev = raw_data.header.hDevice.0;
+    let dev_info = devices
+        .get(&hdev)
+        .ok_or_else(|| anyhow!("device info for {} not found", lparam.0))?;
+
+    let mut data_list = allocate_buffer::<HIDP_DATA>(raw_data.data.hid.dwCount as usize);
+    let mut data_len = data_list.len() as u32;
+
+    let b_raw_data_size = (raw_data.data.hid.dwCount * raw_data.data.hid.dwSizeHid) as usize;
+    let b_raw =
+        std::slice::from_raw_parts_mut(raw_data.data.hid.bRawData.as_mut_ptr(), b_raw_data_size);
+
+    HidP_GetData(
+        HidP_Input,
+        data_list.as_mut_ptr(),
+        &mut data_len,
+        dev_info.pre_parsed_data.as_ptr() as isize,
+        b_raw,
+    )
+    .context("HidP_GetData")?;
+
+    let mut states = DeviceObjectStates {
+        buttons: allocate_buffer(dev_info.buttons),
+        axis: allocate_buffer(dev_info.axises.len()),
+        sliders: allocate_buffer(dev_info.sliders),
+        hats: allocate_buffer(dev_info.hats),
+    };
+
+    for data in data_list.into_iter().take(data_len as usize) {
+        let obj_idx = match dev_info.mapping.get(&data.DataIndex) {
+            Some(i) => i,
+            None => {
+                trace!("object index not found for {}", data.DataIndex);
+                continue;
+            }
+        };
+
+        let _data_span = warn_span!("value data", data_idx = data.DataIndex, ?obj_idx).entered();
+
+        match obj_idx {
+            DeviceObjectIndex::Button(idx) => {
+                if let Some(p) = states.buttons.get_mut(*idx) {
+                    *p = if data.Anonymous.On.as_bool() {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Releaed
+                    }
+                } else {
+                    warn!("button object not found");
+                }
+            }
+
+            DeviceObjectIndex::Axis(idx) => {
+                if let Some(p) = states.axis.get_mut(*idx) {
+                    p.replace(data.Anonymous.RawValue as i32);
+                } else {
+                    warn!("axis object not found");
+                }
+            }
+
+            DeviceObjectIndex::Slider(idx) => {
+                if let Some(p) = states.sliders.get_mut(*idx) {
+                    p.replace(data.Anonymous.RawValue as i32);
+                } else {
+                    warn!("slider object not found");
+                }
+            }
+
+            DeviceObjectIndex::Hat(idx) => {
+                if let Some(p) = states.hats.get_mut(*idx) {
+                    let st = match data.Anonymous.RawValue {
+                        0 => HatState::Up,
+                        1 => HatState::UpRight,
+                        2 => HatState::Right,
+                        3 => HatState::DownRight,
+                        4 => HatState::Down,
+                        5 => HatState::DownLeft,
+                        6 => HatState::Left,
+                        7 => HatState::UpLeft,
+                        _other => HatState::Null,
+                    };
+                    *p = st;
+                } else {
+                    warn!("hat object not found");
+                }
+            }
+
+            DeviceObjectIndex::Unknown(_, _) => {
+                trace!("ignore value data");
+            }
+        }
+    }
+
+    Ok((hdev, states))
 }
 
 unsafe fn proc_input_change_message(
@@ -399,6 +549,11 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
 
     let pre_data_buf_ptr = pre_data_buf.as_ptr() as isize;
 
+    // let max_data_count = HidP_MaxDataListLength(HidP_Input, pre_data_buf_ptr);
+    // if max_data_count == 0 {
+    //     return Err(anyhow!("failed to get max data count of HidP_Input"));
+    // }
+
     let mut hidp_caps = HIDP_CAPS::default();
     HidP_GetCaps(pre_data_buf_ptr, &mut hidp_caps).context("get device caps")?;
 
@@ -406,7 +561,14 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
 
     let mut info = DevInfo {
         name: hname,
-        ..Default::default()
+        pre_parsed_data: pre_data_buf,
+        // max_data_count,
+        // hidp_caps,
+        buttons: 0,
+        axises: Default::default(),
+        sliders: 0,
+        hats: 0,
+        mapping: Default::default(),
     };
 
     let mut axis_specs = Vec::new();
@@ -573,7 +735,7 @@ unsafe fn start_event_loop(hwnd: HWND, cfg: Config, tx: &Sender<Result<Event>>) 
             }
 
             WM_INPUT => {
-                proc_input_message(&devices, msg.wParam, msg.lParam).context("proc input msg")
+                proc_input_message(&devices, hwnd, msg.wParam, msg.lParam).context("proc input msg")
             }
             WM_INPUT_DEVICE_CHANGE => {
                 proc_input_change_message(&mut devices, msg.wParam, msg.lParam)
@@ -587,12 +749,8 @@ unsafe fn start_event_loop(hwnd: HWND, cfg: Config, tx: &Sender<Result<Event>>) 
 
         trace!("processed");
 
-        match res {
-            Ok(evt) => tx.send(Ok(evt)).context("event chan broken")?,
-            Err(e) => {
-                warn!("failed: {:?}", e);
-            }
-        }
+        let evt = res.unwrap_or_else(Event::Warning);
+        tx.send(Ok(evt)).context("event chan broken")?;
     }
 }
 
@@ -647,333 +805,3 @@ unsafe fn is_hid_joystick(info: &RID_DEVICE_INFO) -> bool {
         && (info.Anonymous.hid.usUsage == HID_USAGE_GENERIC_JOYSTICK
             || info.Anonymous.hid.usUsage == HID_USAGE_GENERIC_GAMEPAD)
 }
-
-// impl Manager {
-//     pub fn new(include_xbox: bool) -> Result<Self> {
-//         let classname = w!("joystick-rs rawinput");
-//         unsafe {
-//             let hinstance = GetModuleHandleW(None)?;
-
-//             let wclass = WNDCLASSEXW {
-//                 cbSize: size_of::<WNDCLASSEXW>() as u32,
-//                 style: WNDCLASS_STYLES::default(),
-//                 lpfnWndProc: Some(window_proc_sys),
-//                 cbClsExtra: 0,
-//                 cbWndExtra: 0,
-//                 hInstance: hinstance,
-//                 hIcon: None.into(),
-//                 hCursor: None.into(),
-//                 hbrBackground: None.into(),
-//                 lpszMenuName: PCWSTR::null(),
-//                 lpszClassName: classname,
-//                 hIconSm: None.into(),
-//             };
-
-//             if RegisterClassExW(&wclass) == 0 {
-//                 return Err(get_last_err("get zero from RegisterClassExW").into());
-//             }
-
-//             let hwnd = CreateWindowExW(
-//                 Default::default(),
-//                 classname,
-//                 classname,
-//                 Default::default(),
-//                 CW_USEDEFAULT,
-//                 CW_USEDEFAULT,
-//                 CW_USEDEFAULT,
-//                 CW_USEDEFAULT,
-//                 HWND_MESSAGE,
-//                 None,
-//                 hinstance,
-//                 None,
-//             );
-
-//             if hwnd.0 == 0 {
-//                 return Err(get_last_err("get null from CreateWindowExW").into());
-//             }
-
-//             println!("window {:?} constructed", hwnd);
-
-//             let mut mgr = Self { hwnd };
-//             mgr.register_devices(include_xbox)?;
-
-//             Ok(mgr)
-//         }
-//     }
-
-//     unsafe fn register_devices(&mut self, include_xbox: bool) -> Result<()> {
-//         // https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/hid-architecture#hid-clients-supported-in-windows
-//         // TODO: RIDEV_DEVNOTIFY
-//         let devices = [
-//             RAWINPUTDEVICE {
-//                 usUsagePage: HID_USAGE_PAGE_GENERIC,
-//                 usUsage: HID_USAGE_GENERIC_JOYSTICK,
-//                 dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
-//                 hwndTarget: self.hwnd,
-//             },
-//             RAWINPUTDEVICE {
-//                 usUsagePage: HID_USAGE_PAGE_GENERIC,
-//                 usUsage: HID_USAGE_GENERIC_GAMEPAD,
-//                 dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
-//                 hwndTarget: self.hwnd,
-//             },
-//         ];
-
-//         RegisterRawInputDevices(
-//             if include_xbox {
-//                 &devices[..]
-//             } else {
-//                 &devices[..1]
-//             },
-//             size_of::<RAWINPUTDEVICE>() as u32,
-//         )
-//         .ok()?;
-
-//         Ok(())
-//     }
-
-//     pub fn list_devices(&mut self) -> Result<Vec<Joystick>> {
-//         let mut dev_list: [RAWINPUTDEVICELIST; RAW_DEV_LIST_NUM] = Default::default();
-//         const DEV_NUM_MAX: u32 = RAW_DEV_LIST_NUM as u32;
-//         let mut dev_num = dev_list.len() as u32;
-
-//         unsafe {
-//             match GetRawInputDeviceList(
-//                 Some(dev_list.as_mut_ptr()),
-//                 &mut dev_num,
-//                 size_of::<RAWINPUTDEVICELIST>() as u32,
-//             ) {
-//                 count @ 0..=DEV_NUM_MAX => {
-//                     dev_num = count;
-//                 }
-
-//                 code if code == ERROR_INSUFFICIENT_BUFFER.0 => {
-//                     return Err(wError::new(
-//                         ERROR_INSUFFICIENT_BUFFER.to_hresult(),
-//                         format!(
-//                             "insufficient buffer for {} devices from GetRawInputDeviceList",
-//                             dev_num
-//                         )
-//                         .into(),
-//                     )
-//                     .into())
-//                 }
-
-//                 FAIL => return Err(get_last_err("GetRawInputDeviceList").into()),
-
-//                 other => {
-//                     return Err(anyhow!(
-//                         "unexpected return value {} from GetRawInputDeviceList",
-//                         other
-//                     ))
-//                 }
-//             };
-
-//             let joysticks = dev_list
-//                 .into_iter()
-//                 .take(dev_num as usize)
-//                 .filter_map(|dev| {
-//                     Joystick::from(dev)
-//                         .map_err(|e| println!("init joystick for {:?}: {:?}", dev.hDevice, e))
-//                         .ok()
-//                         .unwrap_or(None)
-//                 })
-//                 .collect();
-
-//             Ok(joysticks)
-//         }
-//     }
-
-//     pub fn on_message(&mut self) -> Result<()> {
-//         unsafe {
-//             let mut msg = MSG::default();
-//             if GetMessageW(&mut msg, self.hwnd, 0, 0).as_bool() {
-//                 println!(
-//                     "get msg: {}: {:?}, {:?}",
-//                     msg.message, msg.wParam, msg.lParam
-//                 );
-//             };
-//         }
-
-//         Ok(())
-//     }
-// }
-
-// #[derive(Debug)]
-// pub struct Joystick {
-//     dev: RAWINPUTDEVICELIST,
-//     name: HSTRING,
-//     info: RID_DEVICE_INFO_HID,
-// }
-
-// impl Joystick {
-//     unsafe fn from(dev: RAWINPUTDEVICELIST) -> Result<Option<Self>> {
-//         if dev.dwType != RIM_TYPEHID {
-//             return Ok(None);
-//         }
-
-//         let mut name_buf = [0u16; 1024];
-//         let name_buf_size = name_buf.len();
-//         let name_buf_used = get_device_info(
-//             dev.hDevice,
-//             RIDI_DEVICENAME,
-//             name_buf.as_mut_ptr(),
-//             Some(name_buf_size),
-//         )?;
-
-//         let name = HSTRING::from_wide(&name_buf[..name_buf_used])?;
-
-//         let mut dev_info = RID_DEVICE_INFO {
-//             cbSize: size_of::<RID_DEVICE_INFO>() as u32,
-//             ..Default::default()
-//         };
-
-//         get_device_info(dev.hDevice, RIDI_DEVICEINFO, &mut dev_info, None)?;
-//         if !is_hid_joystick(&dev_info.Anonymous.hid) {
-//             return Ok(None);
-//         }
-
-//         // get pre parsed data
-//         let pre_data_size = get_device_info_size(dev.hDevice, RIDI_PREPARSEDDATA)?;
-//         let mut pre_data_buf = allocate_buffer::<u8>(pre_data_size);
-//         get_device_info(
-//             dev.hDevice,
-//             RIDI_PREPARSEDDATA,
-//             pre_data_buf.as_mut_ptr(),
-//             Some(pre_data_size),
-//         )?;
-
-//         let pre_data_buf_ptr = pre_data_buf.as_ptr() as isize;
-
-//         let mut hidp_caps = HIDP_CAPS::default();
-//         HidP_GetCaps(pre_data_buf_ptr, &mut hidp_caps)?;
-
-//         println!("Caps: {:?}", hidp_caps);
-
-//         let buttons = if hidp_caps.NumberInputButtonCaps > 0 {
-//             let mut button_num = hidp_caps.NumberInputButtonCaps;
-//             let mut buttons = allocate_buffer::<HIDP_BUTTON_CAPS>(button_num as usize);
-
-//             HidP_GetButtonCaps(
-//                 HidP_Input,
-//                 buttons.as_mut_ptr(),
-//                 &mut button_num,
-//                 pre_data_buf_ptr,
-//             )?;
-
-//             println!(
-//                 "Buttons [{}, {}]",
-//                 buttons[0].Anonymous.Range.UsageMin, buttons[0].Anonymous.Range.UsageMax
-//             );
-
-//             buttons
-//         } else {
-//             Vec::new()
-//         };
-
-//         let values = if hidp_caps.NumberInputValueCaps > 0 {
-//             let mut value_num = hidp_caps.NumberInputValueCaps;
-//             let mut values = allocate_buffer::<HIDP_VALUE_CAPS>(value_num as usize);
-
-//             HidP_GetValueCaps(
-//                 HidP_Input,
-//                 values.as_mut_ptr(),
-//                 &mut value_num,
-//                 pre_data_buf_ptr,
-//             )?;
-
-//             // see https://www.usb.org/document-library/hid-usage-tables-14
-//             for val in values.iter() {
-//                 println!("Report Count: {}", val.ReportCount);
-//                 match (val.UsagePage, val.Anonymous.Range.UsageMin) {
-//                     (HID_USAGE_PAGE_GENERIC, 0x30) => println!(
-//                         "Value: XAxis {:?} {:?} [{}, {}] [{}, {}]",
-//                         val.IsAbsolute,
-//                         val.HasNull,
-//                         val.LogicalMin,
-//                         val.LogicalMax,
-//                         val.PhysicalMin,
-//                         val.PhysicalMax
-//                     ),
-//                     (HID_USAGE_PAGE_GENERIC, 0x31) => println!(
-//                         "Value: YAxis {:?} {:?} [{}, {}] [{}, {}]",
-//                         val.IsAbsolute,
-//                         val.HasNull,
-//                         val.LogicalMin,
-//                         val.LogicalMax,
-//                         val.PhysicalMin,
-//                         val.PhysicalMax
-//                     ),
-//                     (HID_USAGE_PAGE_GENERIC, 0x32) => println!(
-//                         "Value: ZAxis {:?} {:?} [{}, {}] [{}, {}]",
-//                         val.IsAbsolute,
-//                         val.HasNull,
-//                         val.LogicalMin,
-//                         val.LogicalMax,
-//                         val.PhysicalMin,
-//                         val.PhysicalMax
-//                     ),
-//                     (HID_USAGE_PAGE_GENERIC, 0x33) => println!(
-//                         "Value: RXAxis {:?} {:?} [{}, {}] [{}, {}]",
-//                         val.IsAbsolute,
-//                         val.HasNull,
-//                         val.LogicalMin,
-//                         val.LogicalMax,
-//                         val.PhysicalMin,
-//                         val.PhysicalMax
-//                     ),
-//                     (HID_USAGE_PAGE_GENERIC, 0x34) => println!(
-//                         "Value: RYAxis {:?} {:?} [{}, {}] [{}, {}]",
-//                         val.IsAbsolute,
-//                         val.HasNull,
-//                         val.LogicalMin,
-//                         val.LogicalMax,
-//                         val.PhysicalMin,
-//                         val.PhysicalMax
-//                     ),
-//                     (HID_USAGE_PAGE_GENERIC, 0x35) => println!(
-//                         "Value: RZAxis {:?} {:?} [{}, {}] [{}, {}]",
-//                         val.IsAbsolute,
-//                         val.HasNull,
-//                         val.LogicalMin,
-//                         val.LogicalMax,
-//                         val.PhysicalMin,
-//                         val.PhysicalMax
-//                     ),
-//                     (HID_USAGE_PAGE_GENERIC, 0x36) => println!(
-//                         "Value: Slider {:?} {:?} [{}, {}] [{}, {}]",
-//                         val.IsAbsolute,
-//                         val.HasNull,
-//                         val.LogicalMin,
-//                         val.LogicalMax,
-//                         val.PhysicalMin,
-//                         val.PhysicalMax
-//                     ),
-//                     (HID_USAGE_PAGE_GENERIC, 0x39) => println!(
-//                         "Value: Hat {:?} {:?} [{}, {}] [{}, {}]",
-//                         val.IsAbsolute,
-//                         val.HasNull,
-//                         val.LogicalMin,
-//                         val.LogicalMax,
-//                         val.PhysicalMin,
-//                         val.PhysicalMax
-//                     ),
-//                     (usage_page, usage_id) if usage_page >= 0xff00 => {
-//                         println!("Vendor Defined {} {}", usage_page, usage_id,)
-//                     }
-//                     other => println!("Unknown Value {:?}", other),
-//                 }
-//             }
-
-//             values
-//         } else {
-//             Vec::new()
-//         };
-
-//         Ok(Some(Self {
-//             dev,
-//             name,
-//             info: dev_info.Anonymous.hid,
-//         }))
-//     }
-// }
