@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use tracing::{debug, trace, warn, warn_span};
+use tracing::{debug, info, trace, warn, warn_span};
 use windows::{
     core::{Error as wError, HSTRING, PCWSTR},
     Win32::{
@@ -120,6 +120,7 @@ impl Config {
                 let _span = warn_span!("event loop", ?hwnd).entered();
                 debug!("start");
                 if let Err(e) = start_event_loop(hwnd, self, &tx) {
+                    warn!("event loop error: {:?}", e);
                     _ = tx.send(Err(e));
                 };
                 debug!("stop");
@@ -339,7 +340,7 @@ unsafe fn proc_input_message(
     })
 }
 
-unsafe fn get_raw_input_data(lparam: LPARAM) -> Result<RAWINPUT> {
+unsafe fn get_raw_input_data(lparam: LPARAM) -> Result<Vec<u8>> {
     let mut raw_data_size = 0u32;
     if GetRawInputData(
         HRAWINPUT(lparam.0),
@@ -352,11 +353,11 @@ unsafe fn get_raw_input_data(lparam: LPARAM) -> Result<RAWINPUT> {
         return Err(get_last_err()).context("get raw data size by calling GetRawInputData");
     };
 
-    let mut raw_data = RAWINPUT::default();
+    let mut raw_data = allocate_buffer::<u8>(raw_data_size as usize);
     if GetRawInputData(
         HRAWINPUT(lparam.0),
         RID_INPUT,
-        Some(&mut raw_data as *mut RAWINPUT as *mut c_void),
+        Some(raw_data.as_mut_ptr() as *mut c_void),
         &mut raw_data_size,
         size_of::<RAWINPUTHEADER>() as u32,
     ) == FAIL
@@ -371,7 +372,9 @@ unsafe fn fetch_input_data(
     devices: &HashMap<isize, DevInfo>,
     lparam: LPARAM,
 ) -> Result<Option<(isize, DeviceObjectStates)>> {
-    let mut raw_data = get_raw_input_data(lparam)?;
+    let mut raw_bytes = get_raw_input_data(lparam)?;
+    let raw_data_ptr = raw_bytes.as_mut_ptr() as *mut RAWINPUT;
+    let raw_data = &mut *raw_data_ptr;
 
     if raw_data.header.dwType != RIM_TYPEHID.0 {
         return Err(anyhow!(
@@ -385,26 +388,6 @@ unsafe fn fetch_input_data(
         .get(&hdev)
         .ok_or_else(|| anyhow!("device info for {} not found", lparam.0))?;
 
-    let mut data_list = allocate_buffer::<HIDP_DATA>(dev_info.max_data_count as usize);
-    let mut data_len = data_list.len() as u32;
-
-    let b_raw_data_size = (raw_data.data.hid.dwCount * raw_data.data.hid.dwSizeHid) as usize;
-    let b_raw =
-        std::slice::from_raw_parts_mut(raw_data.data.hid.bRawData.as_mut_ptr(), b_raw_data_size);
-
-    HidP_GetData(
-        HidP_Input,
-        data_list.as_mut_ptr(),
-        &mut data_len,
-        dev_info.pre_parsed_data.as_ptr() as isize,
-        b_raw,
-    )
-    .context("HidP_GetData")?;
-
-    if data_len == 0 {
-        return Ok(None);
-    }
-
     let mut states = DeviceObjectStates {
         buttons: allocate_buffer(dev_info.buttons),
         axis: allocate_buffer(dev_info.axises.len()),
@@ -412,69 +395,103 @@ unsafe fn fetch_input_data(
         hats: allocate_buffer(dev_info.hats),
     };
 
-    for data in data_list.into_iter().take(data_len as usize) {
-        let obj_idx = match dev_info.mapping.get(&data.DataIndex) {
-            Some(i) => i,
-            None => {
-                trace!("object index not found for {}", data.DataIndex);
-                continue;
-            }
-        };
+    let b_raw_data_size = (raw_data.data.hid.dwCount * raw_data.data.hid.dwSizeHid) as usize;
+    let b_raw =
+        std::slice::from_raw_parts_mut(raw_data.data.hid.bRawData.as_mut_ptr(), b_raw_data_size);
 
-        let _data_span = warn_span!("value data", data_idx = data.DataIndex, ?obj_idx).entered();
+    let mut total_items = 0;
 
-        match obj_idx {
-            DeviceObjectIndex::Button(idx) => {
-                if let Some(p) = states.buttons.get_mut(*idx) {
-                    *p = if data.Anonymous.On.as_bool() {
-                        ButtonState::Pressed
+    for i in 0..raw_data.data.hid.dwCount {
+        let start = (i * raw_data.data.hid.dwSizeHid) as usize;
+        let part = &mut b_raw[start..start + raw_data.data.hid.dwSizeHid as usize];
+
+        let mut data_list = allocate_buffer::<HIDP_DATA>(dev_info.max_data_count as usize);
+        let mut data_len = data_list.len() as u32;
+
+        HidP_GetData(
+            HidP_Input,
+            data_list.as_mut_ptr(),
+            &mut data_len,
+            dev_info.pre_parsed_data.as_ptr() as isize,
+            part,
+        )
+        .with_context(|| format!("HidP_GetData #{}", 0))?;
+
+        if data_len == 0 {
+            continue;
+        }
+
+        total_items += data_len;
+
+        for data in data_list.into_iter().take(data_len as usize) {
+            let obj_idx = match dev_info.mapping.get(&data.DataIndex) {
+                Some(i) => i,
+                None => {
+                    trace!("object index not found for {}", data.DataIndex);
+                    continue;
+                }
+            };
+
+            let _data_span =
+                warn_span!("value data", data_idx = data.DataIndex, ?obj_idx).entered();
+
+            match obj_idx {
+                DeviceObjectIndex::Button(idx) => {
+                    if let Some(p) = states.buttons.get_mut(*idx) {
+                        *p = if data.Anonymous.On.as_bool() {
+                            ButtonState::Pressed
+                        } else {
+                            ButtonState::Releaed
+                        }
                     } else {
-                        ButtonState::Releaed
+                        warn!("button object not found");
                     }
-                } else {
-                    warn!("button object not found");
                 }
-            }
 
-            DeviceObjectIndex::Axis(idx) => {
-                if let Some(p) = states.axis.get_mut(*idx) {
-                    p.replace(data.Anonymous.RawValue as i32);
-                } else {
-                    warn!("axis object not found");
+                DeviceObjectIndex::Axis(idx) => {
+                    if let Some(p) = states.axis.get_mut(*idx) {
+                        p.replace(data.Anonymous.RawValue as i32);
+                    } else {
+                        warn!("axis object not found");
+                    }
                 }
-            }
 
-            DeviceObjectIndex::Slider(idx) => {
-                if let Some(p) = states.sliders.get_mut(*idx) {
-                    p.replace(data.Anonymous.RawValue as i32);
-                } else {
-                    warn!("slider object not found");
+                DeviceObjectIndex::Slider(idx) => {
+                    if let Some(p) = states.sliders.get_mut(*idx) {
+                        p.replace(data.Anonymous.RawValue as i32);
+                    } else {
+                        warn!("slider object not found");
+                    }
                 }
-            }
 
-            DeviceObjectIndex::Hat(idx) => {
-                if let Some(p) = states.hats.get_mut(*idx) {
-                    let st = match data.Anonymous.RawValue {
-                        0 => HatState::Up,
-                        1 => HatState::UpRight,
-                        2 => HatState::Right,
-                        3 => HatState::DownRight,
-                        4 => HatState::Down,
-                        5 => HatState::DownLeft,
-                        6 => HatState::Left,
-                        7 => HatState::UpLeft,
-                        _other => HatState::Null,
-                    };
-                    *p = st;
-                } else {
-                    warn!("hat object not found");
+                DeviceObjectIndex::Hat(idx) => {
+                    if let Some(p) = states.hats.get_mut(*idx) {
+                        let st = match data.Anonymous.RawValue {
+                            0 => HatState::Up,
+                            1 => HatState::UpRight,
+                            2 => HatState::Right,
+                            3 => HatState::DownRight,
+                            4 => HatState::Down,
+                            5 => HatState::DownLeft,
+                            6 => HatState::Left,
+                            7 => HatState::UpLeft,
+                            _other => HatState::Null,
+                        };
+                        *p = st;
+                    } else {
+                        warn!("hat object not found");
+                    }
                 }
-            }
 
-            DeviceObjectIndex::Unknown(_, _) => {
-                trace!("ignore value data");
+                DeviceObjectIndex::Unknown(_, _) => {
+                    trace!("ignore value data");
+                }
             }
         }
+    }
+
+    if total_items == 0 {
+        return Ok(None);
     }
 
     Ok(Some((hdev, states)))
@@ -758,7 +775,7 @@ unsafe fn start_event_loop(hwnd: HWND, cfg: Config, tx: &Sender<Result<Event>>) 
 
         trace!("processed");
 
-        if let Some(evt) = res.unwrap_or_else(|e| Some(Event::Warning(e))) {
+        if let Some(evt) = res.context("last event failure")? {
             tx.send(Ok(evt)).context("event chan broken")?;
         };
     }

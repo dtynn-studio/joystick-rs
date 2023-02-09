@@ -63,7 +63,7 @@ pub enum AxisType {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonState {
     Pressed = 1,
     Releaed = 0,
@@ -75,7 +75,7 @@ impl Default for ButtonState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HatState {
     Null,
     Up,
