@@ -13,10 +13,11 @@ use windows::{
     Win32::{
         Devices::HumanInterfaceDevice::{
             HidP_GetButtonCaps, HidP_GetCaps, HidP_GetData, HidP_GetValueCaps, HidP_Input,
-            HIDP_BUTTON_CAPS, HIDP_CAPS, HIDP_DATA, HIDP_VALUE_CAPS, HID_USAGE_GENERIC_GAMEPAD,
-            HID_USAGE_GENERIC_HATSWITCH, HID_USAGE_GENERIC_JOYSTICK, HID_USAGE_GENERIC_RX,
-            HID_USAGE_GENERIC_RY, HID_USAGE_GENERIC_RZ, HID_USAGE_GENERIC_SLIDER,
-            HID_USAGE_GENERIC_X, HID_USAGE_GENERIC_Y, HID_USAGE_GENERIC_Z, HID_USAGE_PAGE_GENERIC,
+            HidP_MaxDataListLength, HIDP_BUTTON_CAPS, HIDP_CAPS, HIDP_DATA, HIDP_VALUE_CAPS,
+            HID_USAGE_GENERIC_GAMEPAD, HID_USAGE_GENERIC_HATSWITCH, HID_USAGE_GENERIC_JOYSTICK,
+            HID_USAGE_GENERIC_RX, HID_USAGE_GENERIC_RY, HID_USAGE_GENERIC_RZ,
+            HID_USAGE_GENERIC_SLIDER, HID_USAGE_GENERIC_X, HID_USAGE_GENERIC_Y,
+            HID_USAGE_GENERIC_Z, HID_USAGE_PAGE_GENERIC,
         },
         Foundation::{HANDLE, HWND, LPARAM, LRESULT, SUCCESS, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
@@ -161,7 +162,7 @@ type DevObjectsMapping = HashMap<u16, DeviceObjectIndex>;
 struct DevInfo {
     name: HSTRING,
     pre_parsed_data: Vec<u8>,
-    // max_data_count: u32,
+    max_data_count: u32,
     // hidp_caps: HIDP_CAPS,
     buttons: usize,
     axises: Vec<AxisType>,
@@ -314,7 +315,7 @@ unsafe fn proc_input_message(
     hwnd: HWND,
     wparam: WPARAM,
     lparam: LPARAM,
-) -> Result<Event> {
+) -> Result<Option<Event>> {
     let is_sink = match wparam.0 as u32 {
         RIM_INPUT => false,
 
@@ -327,13 +328,14 @@ unsafe fn proc_input_message(
 
     if !is_sink {
         // TODO: handle the result?
-        DefWindowProcW(hwnd, WM_INPUT, wparam, lparam);
     }
 
-    res.map(|(hdl, states)| Event::DeviceState {
-        ident: hdl,
-        is_sink,
-        states,
+    res.map(|r| {
+        r.map(|(hdl, states)| Event::DeviceState {
+            ident: hdl,
+            is_sink,
+            states,
+        })
     })
 }
 
@@ -368,7 +370,7 @@ unsafe fn get_raw_input_data(lparam: LPARAM) -> Result<RAWINPUT> {
 unsafe fn fetch_input_data(
     devices: &HashMap<isize, DevInfo>,
     lparam: LPARAM,
-) -> Result<(isize, DeviceObjectStates)> {
+) -> Result<Option<(isize, DeviceObjectStates)>> {
     let mut raw_data = get_raw_input_data(lparam)?;
 
     if raw_data.header.dwType != RIM_TYPEHID.0 {
@@ -383,7 +385,7 @@ unsafe fn fetch_input_data(
         .get(&hdev)
         .ok_or_else(|| anyhow!("device info for {} not found", lparam.0))?;
 
-    let mut data_list = allocate_buffer::<HIDP_DATA>(raw_data.data.hid.dwCount as usize);
+    let mut data_list = allocate_buffer::<HIDP_DATA>(dev_info.max_data_count as usize);
     let mut data_len = data_list.len() as u32;
 
     let b_raw_data_size = (raw_data.data.hid.dwCount * raw_data.data.hid.dwSizeHid) as usize;
@@ -398,6 +400,10 @@ unsafe fn fetch_input_data(
         b_raw,
     )
     .context("HidP_GetData")?;
+
+    if data_len == 0 {
+        return Ok(None);
+    }
 
     let mut states = DeviceObjectStates {
         buttons: allocate_buffer(dev_info.buttons),
@@ -471,7 +477,7 @@ unsafe fn fetch_input_data(
         }
     }
 
-    Ok((hdev, states))
+    Ok(Some((hdev, states)))
 }
 
 unsafe fn proc_input_change_message(
@@ -549,10 +555,10 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
 
     let pre_data_buf_ptr = pre_data_buf.as_ptr() as isize;
 
-    // let max_data_count = HidP_MaxDataListLength(HidP_Input, pre_data_buf_ptr);
-    // if max_data_count == 0 {
-    //     return Err(anyhow!("failed to get max data count of HidP_Input"));
-    // }
+    let max_data_count = HidP_MaxDataListLength(HidP_Input, pre_data_buf_ptr);
+    if max_data_count == 0 {
+        return Err(anyhow!("failed to get max data count of HidP_Input"));
+    }
 
     let mut hidp_caps = HIDP_CAPS::default();
     HidP_GetCaps(pre_data_buf_ptr, &mut hidp_caps).context("get device caps")?;
@@ -562,7 +568,7 @@ unsafe fn get_device(dev_hdl: HANDLE) -> Result<(DevInfo, DeviceSpecs)> {
     let mut info = DevInfo {
         name: hname,
         pre_parsed_data: pre_data_buf,
-        // max_data_count,
+        max_data_count,
         // hidp_caps,
         buttons: 0,
         axises: Default::default(),
@@ -739,6 +745,7 @@ unsafe fn start_event_loop(hwnd: HWND, cfg: Config, tx: &Sender<Result<Event>>) 
             }
             WM_INPUT_DEVICE_CHANGE => {
                 proc_input_change_message(&mut devices, msg.wParam, msg.lParam)
+                    .map(Some)
                     .context("proc input change msg")
             }
             _other => {
@@ -747,10 +754,13 @@ unsafe fn start_event_loop(hwnd: HWND, cfg: Config, tx: &Sender<Result<Event>>) 
             }
         };
 
+        _ = DefWindowProcW(hwnd, msg.message, msg.wParam, msg.lParam);
+
         trace!("processed");
 
-        let evt = res.unwrap_or_else(Event::Warning);
-        tx.send(Ok(evt)).context("event chan broken")?;
+        if let Some(evt) = res.unwrap_or_else(|e| Some(Event::Warning(e))) {
+            tx.send(Ok(evt)).context("event chan broken")?;
+        };
     }
 }
 
