@@ -1,11 +1,14 @@
+use std::fmt::Debug;
+
 use anyhow::{Error, Result};
 use crossbeam_channel::Receiver;
 
 use crate::{AxisIdent, AxisState, DPadState, Joystick, ObjectDiff};
 
 mod bits;
+pub mod rawinput;
 
-use bits::Bits;
+pub use bits::*;
 
 pub struct StateDiff<B: Bits> {
     dpad: Option<DPadState>,
@@ -49,7 +52,7 @@ impl<B: Bits> StateDiff<B> {
     }
 }
 
-pub enum Event<DI, B: Bits> {
+pub enum Event<DI: Debug + PartialEq, B: Bits> {
     Attached(DI),
     Deattached(DI),
     StateDiff {
@@ -61,10 +64,10 @@ pub enum Event<DI, B: Bits> {
 }
 
 pub trait Driver {
-    type DeviceIdent;
+    type DeviceIdent: Debug + PartialEq;
     type ButtonBits: Bits;
 
     fn as_event_receiver(&self) -> &Receiver<Result<Event<Self::DeviceIdent, Self::ButtonBits>>>;
 
-    fn close(self) -> Result<()>;
+    fn close(self);
 }
