@@ -11,7 +11,7 @@ mod api;
 
 pub struct RawInput {
     ctx: Option<(HWND, JoinHandle<()>)>,
-    event_rx: Receiver<Result<Event<HSTRING, u32>>>,
+    event_rx: Receiver<Event<HSTRING, u32>>,
 }
 
 impl RawInput {
@@ -33,10 +33,12 @@ impl RawInput {
 
             let _span = warn_span!("message loop", ?hwnd).entered();
             debug!("start");
-            if let Err(e) = unsafe { api::start_message_loop(hwnd, &event_tx) } {
+            let res = unsafe { api::start_message_loop(hwnd, &event_tx) };
+            if let Err(e) = res.as_ref() {
                 warn!("fail: {:?}", e);
-                _ = event_tx.send(Err(e));
-            };
+            }
+
+            _ = event_tx.send(Event::Interruption(res));
             debug!("stop");
         });
 
@@ -74,7 +76,7 @@ impl Driver for RawInput {
     type DeviceIdent = HSTRING;
     type ButtonBits = u32;
 
-    fn as_event_receiver(&self) -> &Receiver<Result<Event<Self::DeviceIdent, Self::ButtonBits>>> {
+    fn as_event_receiver(&self) -> &Receiver<Event<Self::DeviceIdent, Self::ButtonBits>> {
         &self.event_rx
     }
 

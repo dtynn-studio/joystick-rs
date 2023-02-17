@@ -1,9 +1,8 @@
-use std::mem::size_of;
-use std::time::SystemTime;
+use std::{collections::HashMap, mem::size_of, time::SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Sender;
-use tracing::trace;
+use tracing::{debug, trace, warn, warn_span};
 
 use windows::{
     core::{Error as wError, HSTRING, PCWSTR},
@@ -26,16 +25,16 @@ use windows::{
                 RIDI_PREPARSEDDATA, RID_DEVICE_INFO, RID_INPUT, RIM_TYPEHID,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, PostMessageW,
-                RegisterClassExW, CW_USEDEFAULT, GIDC_ARRIVAL, GIDC_REMOVAL, HWND_MESSAGE, MSG,
-                RIM_INPUT, RIM_INPUTSINK, WM_CLOSE, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WNDCLASSEXW,
-                WNDCLASS_STYLES,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+                PostMessageW, RegisterClassExW, CW_USEDEFAULT, GIDC_ARRIVAL, GIDC_REMOVAL,
+                HWND_MESSAGE, MSG, RIM_INPUT, RIM_INPUTSINK, WM_CLOSE, WM_INPUT,
+                WM_INPUT_DEVICE_CHANGE, WNDCLASSEXW, WNDCLASS_STYLES,
             },
         },
     },
 };
 
-use crate::driver::Event;
+type Event = crate::driver::Event<HSTRING, u32>;
 
 const FAIL: u32 = -1i32 as u32;
 
@@ -124,9 +123,89 @@ pub(super) unsafe fn close_message_window(hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
-pub(super) unsafe fn start_message_loop(
-    hwnd: HWND,
-    event_tx: &Sender<Result<Event<HSTRING, u32>>>,
-) -> Result<()> {
-    unimplemented!();
+struct DeviceCap {}
+
+pub(super) unsafe fn start_message_loop(hwnd: HWND, event_tx: &Sender<Event>) -> Result<()> {
+    register_events(hwnd).context("register events")?;
+    debug!("register rawinput events");
+
+    loop {
+        trace!("waiting for message");
+        let mut msg = MSG::default();
+
+        match GetMessageW(&mut msg, hwnd, 0, WM_INPUT).0 {
+            0 => return Ok(()),
+            -1 => return Err(get_last_err()).context("GetMessageW"),
+            _ => {}
+        };
+
+        let _span =
+            warn_span!("message", msg.message, ?msg.hwnd, ?msg.wParam, ?msg.lParam).entered();
+
+        let mut dev_caps = HashMap::new();
+
+        let event_res = match msg.message {
+            WM_CLOSE => {
+                if !DestroyWindow(hwnd).as_bool() {
+                    warn!("destory window: {:?}", get_last_err());
+                }
+                return Ok(());
+            }
+
+            WM_INPUT => process_input_message(&dev_caps, msg.wParam, msg.lParam)
+                .context("process input event"),
+
+            WM_INPUT_DEVICE_CHANGE => {
+                process_input_change_message(&mut dev_caps, msg.wParam, msg.lParam)
+                    .context("process input change event")
+            }
+
+            _ => Ok(None),
+        };
+
+        DispatchMessageW(&msg);
+
+        if let Some(evt) = event_res.unwrap_or_else(|e| Some(Event::Warn(e))) {
+            event_tx.send(evt).context("event chan broken")?;
+        }
+    }
+}
+
+unsafe fn register_events(hwnd: HWND) -> Result<()> {
+    let devices_opts = [
+        RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_JOYSTICK,
+            dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
+            hwndTarget: hwnd,
+        },
+        RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_GAMEPAD,
+            dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
+            hwndTarget: hwnd,
+        },
+    ];
+
+    RegisterRawInputDevices(devices_opts.as_slice(), size_of::<RAWINPUTDEVICE>() as u32)
+        .ok()
+        .context("RegisterRawInputDevices")?;
+
+    Ok(())
+}
+
+unsafe fn process_input_change_message(
+    deivces: &mut HashMap<isize, DeviceCap>,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Result<Option<Event>> {
+    unimplemented!()
+}
+
+unsafe fn process_input_message(
+    dev_caps: &HashMap<isize, DeviceCap>,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Result<Option<Event>> {
+    unimplemented!()
 }

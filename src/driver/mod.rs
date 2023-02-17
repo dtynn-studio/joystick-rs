@@ -61,13 +61,14 @@ pub enum Event<DI: Debug + PartialEq, B: Bits> {
         diff: StateDiff<B>,
     },
     Warn(Error),
+    Interruption(Result<()>),
 }
 
 pub trait Driver {
     type DeviceIdent: Debug + PartialEq;
     type ButtonBits: Bits;
 
-    fn as_event_receiver(&self) -> &Receiver<Result<Event<Self::DeviceIdent, Self::ButtonBits>>>;
+    fn as_event_receiver(&self) -> &Receiver<Event<Self::DeviceIdent, Self::ButtonBits>>;
 
     fn close(self);
 }
