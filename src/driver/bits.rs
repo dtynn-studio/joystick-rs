@@ -1,9 +1,11 @@
 use std::ops::BitXor;
 
-pub trait Bits: Sized + BitXor<Output = Self> {
+pub trait Bits: Sized + BitXor<Output = Self> + Default {
     const CAP: usize;
 
     fn bit(&self, pos: usize) -> Option<bool>;
+
+    fn set(&mut self, pos: usize) -> bool;
 
     fn count_ones(&self) -> u32;
 }
@@ -22,6 +24,15 @@ macro_rules! impl_bits {
                 Some((self & (1 << pos)) != 0)
             }
 
+            fn set(&mut self, pos: usize) -> bool {
+                if pos >= Self::CAP {
+                    return false;
+                }
+
+                *self |= (1 << pos);
+                true
+            }
+
             #[inline]
             fn count_ones(&self) -> u32 {
                 <$t>::count_ones(*self)
@@ -35,6 +46,7 @@ impl_bits!(u64, 64);
 impl_bits!(u128, 128);
 
 #[repr(transparent)]
+#[derive(Debug, Default)]
 pub struct B256([u128; 2]);
 
 impl BitXor for B256 {
@@ -58,6 +70,20 @@ impl Bits for B256 {
         } else {
             (self.0[1] & (1 << (pos - 128))) != 0
         })
+    }
+
+    fn set(&mut self, pos: usize) -> bool {
+        if pos >= Self::CAP {
+            return false;
+        }
+
+        if pos < 128 {
+            self.0[0] |= 1 << pos;
+        } else {
+            self.0[1] |= 1 << (pos - 128);
+        }
+
+        true
     }
 
     fn count_ones(&self) -> u32 {

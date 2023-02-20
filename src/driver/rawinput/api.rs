@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem::size_of, time::SystemTime};
+use std::{collections::HashMap, ffi::c_void, mem::size_of, time::SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Sender;
@@ -34,7 +34,13 @@ use windows::{
     },
 };
 
-type Event = crate::driver::Event<HSTRING, u32>;
+use super::ButtonBits;
+use crate::{
+    driver::{Bits, DeviceInfo},
+    AxisIdent, ButtonIdent, DPadState,
+};
+
+type Event = crate::driver::Event<isize, u32>;
 
 const FAIL: u32 = -1i32 as u32;
 
@@ -123,7 +129,50 @@ pub(super) unsafe fn close_message_window(hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
-struct DeviceCap {}
+#[derive(Default)]
+struct DeviceCap {
+    dpad: Option<HIDP_VALUE_CAPS>,
+    button_caps: Option<Vec<HIDP_BUTTON_CAPS>>,
+    buttons_num: usize,
+    axis_caps: [Option<HIDP_VALUE_CAPS>; AxisIdent::Limit as usize],
+    slider: Option<HIDP_VALUE_CAPS>,
+    mapping: HashMap<u16, DeviceObjectIndex>,
+}
+
+#[derive(Debug)]
+enum DeviceObjectIndex {
+    DPad,
+    Button(ButtonIdent),
+    Axis(AxisIdent),
+    Slider,
+}
+
+#[derive(Debug)]
+struct DeviceObjectStates {
+    dpad: Option<DPadState>,
+    buttons: ButtonBits,
+    axis: [Option<i32>; AxisIdent::Limit as usize],
+    slider: Option<i32>,
+}
+
+impl Default for DeviceObjectStates {
+    fn default() -> Self {
+        DeviceObjectStates {
+            dpad: None,
+            buttons: ButtonBits::default(),
+            axis: [None; 6],
+            slider: None,
+        }
+    }
+}
+
+struct DeviceStatus {
+    name: HSTRING,
+    max_data_count: u32,
+    pre_parsed_data: Vec<u8>,
+    cap: DeviceCap,
+    obj_states: DeviceObjectStates,
+}
 
 pub(super) unsafe fn start_message_loop(hwnd: HWND, event_tx: &Sender<Event>) -> Result<()> {
     register_events(hwnd).context("register events")?;
@@ -140,9 +189,9 @@ pub(super) unsafe fn start_message_loop(hwnd: HWND, event_tx: &Sender<Event>) ->
         };
 
         let _span =
-            warn_span!("message", msg.message, ?msg.hwnd, ?msg.wParam, ?msg.lParam).entered();
+            warn_span!("message", code = msg.message, hwnd = ?msg.hwnd, wparam = ?msg.wParam, lparam = ?msg.lParam).entered();
 
-        let mut dev_caps = HashMap::new();
+        let mut devices = HashMap::new();
 
         let event_res = match msg.message {
             WM_CLOSE => {
@@ -152,11 +201,11 @@ pub(super) unsafe fn start_message_loop(hwnd: HWND, event_tx: &Sender<Event>) ->
                 return Ok(());
             }
 
-            WM_INPUT => process_input_message(&dev_caps, msg.wParam, msg.lParam)
+            WM_INPUT => process_input_message(&devices, msg.wParam, msg.lParam)
                 .context("process input event"),
 
             WM_INPUT_DEVICE_CHANGE => {
-                process_input_change_message(&mut dev_caps, msg.wParam, msg.lParam)
+                process_input_change_message(&mut devices, msg.wParam, msg.lParam)
                     .context("process input change event")
             }
 
@@ -195,17 +244,347 @@ unsafe fn register_events(hwnd: HWND) -> Result<()> {
 }
 
 unsafe fn process_input_change_message(
-    deivces: &mut HashMap<isize, DeviceCap>,
+    deivces: &mut HashMap<isize, DeviceStatus>,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Result<Option<Event>> {
+    let _span = warn_span!("input change").entered();
+    match wparam.0 as u32 {
+        GIDC_ARRIVAL => {}
+        GIDC_REMOVAL => {
+            return {
+                if deivces.remove(&lparam.0).is_none() {
+                    warn!("no device found on removal");
+                }
+
+                Ok(Some(Event::Deattached(lparam.0)))
+            }
+        }
+
+        _other => {
+            warn!("unexpected wparam");
+            return Ok(None);
+        }
+    };
+
+    let (pub_info, profile) = match get_device(HANDLE(lparam.0)).context("get device info")? {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+
+    deivces.insert(lparam.0, profile);
+
+    Ok(Some(Event::Attached(lparam.0, pub_info)))
+}
+
+unsafe fn get_device(hdl: HANDLE) -> Result<Option<(DeviceInfo, DeviceStatus)>> {
+    // device name
+    let mut name_buf = [0u16; 1024];
+    let name_buf_size = name_buf.len();
+    let name_buf_used = sys_get_device_info(
+        hdl,
+        RIDI_DEVICENAME,
+        name_buf.as_mut_ptr(),
+        Some(name_buf_size),
+    )
+    .context("get device name")?;
+
+    let hname = HSTRING::from_wide(&name_buf[..name_buf_used.min(name_buf_size)])
+        .context("construct device name string")?;
+
+    // device info
+    let mut dev_info = RID_DEVICE_INFO {
+        cbSize: size_of::<RID_DEVICE_INFO>() as u32,
+        ..Default::default()
+    };
+
+    sys_get_device_info(hdl, RIDI_DEVICEINFO, &mut dev_info, None)?;
+    if !is_hid_joystick(&dev_info) {
+        warn!(
+            dw = dev_info.dwType.0,
+            page = dev_info.Anonymous.hid.usUsagePage,
+            usage = dev_info.Anonymous.hid.usUsage,
+            "device info of unsupported type"
+        );
+        return Ok(None);
+    }
+
+    // get pre parsed data
+    let pre_parsed_data_size =
+        sys_get_device_info_size(hdl, RIDI_PREPARSEDDATA).context("get pre parsed data size")?;
+
+    let mut pre_parsed_data = allocate_buffer::<u8>(pre_parsed_data_size);
+    sys_get_device_info(
+        hdl,
+        RIDI_PREPARSEDDATA,
+        pre_parsed_data.as_mut_ptr(),
+        Some(pre_parsed_data_size),
+    )
+    .context("get pre parsed data")?;
+
+    let pre_parsed_data_ptr = pre_parsed_data.as_ptr() as isize;
+
+    let max_data_count = HidP_MaxDataListLength(HidP_Input, pre_parsed_data_ptr);
+    if max_data_count == 0 {
+        return Err(anyhow!("failed to get max data count of HidP_Input"));
+    }
+
+    // get device caps
+    let cap = match get_device_cap(pre_parsed_data_ptr).context("get device cap")? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    let mut info = DeviceInfo {
+        name: hname.to_string_lossy(),
+        buttons_num: cap.buttons_num,
+        dpad: cap.dpad.is_some(),
+        axis: Default::default(),
+        slider: None,
+    };
+
+    for (idx, value) in cap.axis_caps.iter().enumerate() {
+        if let Some(val_caps) = value {
+            let (mut vmin, mut vmax) = (val_caps.LogicalMin, val_caps.LogicalMax);
+            if vmin == 0 && vmax == -1 {
+                vmin = 0;
+                vmax = u16::MAX as i32;
+            }
+
+            info.axis[idx].replace((vmin, vmax));
+        }
+    }
+
+    if let Some(val_caps) = cap.slider.as_ref() {
+        info.slider
+            .replace((val_caps.LogicalMin, val_caps.LogicalMax));
+    }
+
+    let status = DeviceStatus {
+        name: hname,
+        max_data_count,
+        pre_parsed_data,
+        cap,
+        obj_states: Default::default(),
+    };
+
+    Ok(Some((info, status)))
+}
+
+#[inline]
+unsafe fn is_hid_joystick(info: &RID_DEVICE_INFO) -> bool {
+    info.dwType == RIM_TYPEHID
+        && info.Anonymous.hid.usUsagePage == HID_USAGE_PAGE_GENERIC
+        && (info.Anonymous.hid.usUsage == HID_USAGE_GENERIC_JOYSTICK
+            || info.Anonymous.hid.usUsage == HID_USAGE_GENERIC_GAMEPAD)
+}
+
+#[inline]
+unsafe fn sys_get_device_info<T>(
+    hdl: HANDLE,
+    cmd: RAW_INPUT_DEVICE_INFO_COMMAND,
+    buf: *mut T,
+    space: Option<usize>,
+) -> Result<usize> {
+    let buf_cap = space.unwrap_or(size_of::<T>()) as u32;
+    let mut buf_size = buf_cap;
+    match GetRawInputDeviceInfoW(hdl, cmd, Some(buf as *mut c_void), &mut buf_size) {
+        FAIL => Err(anyhow!(
+            "insufficient buf for {:?}, {} required",
+            cmd,
+            buf_size
+        )),
+
+        num if num <= buf_cap => Ok(num as usize),
+
+        other => {
+            Err(get_last_err()).with_context(|| format!("unexpected ret {} for {:?}", other, cmd))
+        }
+    }
+}
+
+#[inline]
+unsafe fn sys_get_device_info_size(
+    hdl: HANDLE,
+    cmd: RAW_INPUT_DEVICE_INFO_COMMAND,
+) -> Result<usize> {
+    let mut size = 0u32;
+    match GetRawInputDeviceInfoW(hdl, cmd, None, &mut size) {
+        SUCCESS => Ok(size as usize),
+        other => {
+            Err(get_last_err()).with_context(|| format!("unexpected ret {} for {:?}", other, cmd))
+        }
+    }
+}
+
+#[inline]
+unsafe fn get_device_cap(pre_parsed_data_ptr: isize) -> Result<Option<DeviceCap>> {
+    let max_data_count = HidP_MaxDataListLength(HidP_Input, pre_parsed_data_ptr);
+    if max_data_count == 0 {
+        return Err(anyhow!("HidP_MaxDataListLength got zero"));
+    }
+
+    let mut hidp_caps = HIDP_CAPS::default();
+    HidP_GetCaps(pre_parsed_data_ptr, &mut hidp_caps).context("HidP_GetCaps")?;
+
+    debug!("hidp caps: {:?}", hidp_caps);
+
+    if hidp_caps.NumberInputButtonCaps == 0 && hidp_caps.NumberInputValueCaps == 0 {
+        warn!("no buttons & values available");
+        return Ok(None);
+    }
+
+    let mut dev_cap = DeviceCap::default();
+
+    // construct button caps and mappings
+    if hidp_caps.NumberInputButtonCaps > 0 {
+        let mut button_caps_num = hidp_caps.NumberInputButtonCaps;
+        let mut button_caps = allocate_buffer::<HIDP_BUTTON_CAPS>(button_caps_num as usize);
+
+        HidP_GetButtonCaps(
+            HidP_Input,
+            button_caps.as_mut_ptr(),
+            &mut button_caps_num,
+            pre_parsed_data_ptr,
+        )
+        .context("HidP_GetButtonCaps")?;
+
+        for button_cap in button_caps.iter().take(button_caps_num as usize) {
+            if button_cap.IsRange.as_bool() {
+                for data_idx in button_cap.Anonymous.Range.DataIndexMin
+                    ..=button_cap.Anonymous.Range.DataIndexMax
+                {
+                    let btn_idx = dev_cap.mapping.len();
+                    dev_cap
+                        .mapping
+                        .insert(data_idx, DeviceObjectIndex::Button(btn_idx));
+                }
+            } else {
+                let btn_idx = dev_cap.mapping.len();
+                dev_cap.mapping.insert(
+                    button_cap.Anonymous.NotRange.DataIndex,
+                    DeviceObjectIndex::Button(btn_idx),
+                );
+            }
+        }
+
+        let buttons_num = dev_cap.mapping.len();
+
+        if buttons_num > ButtonBits::CAP {
+            warn!(
+                cap = ButtonBits::CAP,
+                num = buttons_num,
+                "input button caps: maximum bits cap exceeded",
+            );
+            return Ok(None);
+        }
+
+        dev_cap.button_caps.replace(button_caps);
+        dev_cap.buttons_num = buttons_num;
+    }
+
+    // construct value caps & mappings
+    if hidp_caps.NumberInputValueCaps > 0 {
+        let mut values_num = hidp_caps.NumberInputValueCaps;
+        let mut values = allocate_buffer::<HIDP_VALUE_CAPS>(values_num as usize);
+
+        HidP_GetValueCaps(
+            HidP_Input,
+            values.as_mut_ptr(),
+            &mut values_num,
+            pre_parsed_data_ptr,
+        )
+        .context("HidP_GetValueCaps")?;
+
+        for cap in values {
+            let (di, usage) = if cap.IsRange.as_bool() {
+                (
+                    cap.Anonymous.Range.DataIndexMin,
+                    cap.Anonymous.Range.UsageMin,
+                )
+            } else {
+                (
+                    cap.Anonymous.NotRange.DataIndex,
+                    cap.Anonymous.NotRange.Usage,
+                )
+            };
+
+            let object = match (cap.UsagePage, usage) {
+                (HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_SLIDER) => {
+                    Some((&mut dev_cap.slider, DeviceObjectIndex::Slider))
+                }
+
+                (HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_HATSWITCH) => {
+                    if !(cap.LogicalMin == 0 && cap.LogicalMax == 7) {
+                        warn!(
+                            min = cap.LogicalMin,
+                            max = cap.LogicalMax,
+                            "unexpected value range for hat"
+                        );
+                        None
+                    } else {
+                        Some((&mut dev_cap.dpad, DeviceObjectIndex::DPad))
+                    }
+                }
+
+                (HID_USAGE_PAGE_GENERIC, usage) if HID_AXIS_USAGES.contains(&usage) => {
+                    let idx = match usage {
+                        HID_USAGE_GENERIC_X => AxisIdent::X,
+                        HID_USAGE_GENERIC_Y => AxisIdent::Y,
+                        HID_USAGE_GENERIC_Z => AxisIdent::Z,
+                        HID_USAGE_GENERIC_RX => AxisIdent::RX,
+                        HID_USAGE_GENERIC_RY => AxisIdent::RY,
+                        HID_USAGE_GENERIC_RZ => AxisIdent::RZ,
+                        _ => unreachable!("unexpected usage id {} for axis", usage),
+                    };
+
+                    dev_cap
+                        .axis_caps
+                        .get_mut(idx as usize)
+                        .map(|slot| (slot, DeviceObjectIndex::Axis(idx)))
+                }
+
+                (_upage, _uid) => None,
+            };
+
+            let _span = warn_span!("value caps", page = cap.UsagePage, usage, di);
+            match object {
+                Some((slot, dev_id)) => {
+                    if let Some(prev) = slot.replace(cap) {
+                        let prev_di = if prev.IsRange.as_bool() {
+                            prev.Anonymous.Range.DataIndexMin
+                        } else {
+                            prev.Anonymous.NotRange.DataIndex
+                        };
+
+                        warn!(prev_di, "duplicate typed object");
+                    }
+
+                    if let Some(prev_dev_id) = dev_cap.mapping.insert(di, dev_id) {
+                        warn!(?prev_dev_id, "duplicate data index");
+                    }
+                }
+
+                None => {
+                    trace!("no slot")
+                }
+            }
+        }
+    }
+
+    Ok(Some(dev_cap))
+}
+
+unsafe fn process_input_message(
+    devices: &HashMap<isize, DeviceStatus>,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Result<Option<Event>> {
     unimplemented!()
 }
 
-unsafe fn process_input_message(
-    dev_caps: &HashMap<isize, DeviceCap>,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> Result<Option<Event>> {
-    unimplemented!()
+#[inline]
+fn allocate_buffer<T: Default + Clone>(cap: usize) -> Vec<T> {
+    let buf = vec![T::default(); cap];
+    buf
 }

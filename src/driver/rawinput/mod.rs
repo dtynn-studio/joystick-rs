@@ -3,15 +3,17 @@ use std::thread::{spawn, JoinHandle};
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver};
 use tracing::{debug, warn, warn_span};
-use windows::{core::HSTRING, Win32::Foundation::HWND};
+use windows::Win32::Foundation::HWND;
 
 use crate::driver::{Driver, Event};
 
 mod api;
 
+type ButtonBits = u32;
+
 pub struct RawInput {
     ctx: Option<(HWND, JoinHandle<()>)>,
-    event_rx: Receiver<Event<HSTRING, u32>>,
+    event_rx: Receiver<Event<isize, u32>>,
 }
 
 impl RawInput {
@@ -73,8 +75,8 @@ impl Drop for RawInput {
 }
 
 impl Driver for RawInput {
-    type DeviceIdent = HSTRING;
-    type ButtonBits = u32;
+    type DeviceIdent = isize;
+    type ButtonBits = ButtonBits;
 
     fn as_event_receiver(&self) -> &Receiver<Event<Self::DeviceIdent, Self::ButtonBits>> {
         &self.event_rx

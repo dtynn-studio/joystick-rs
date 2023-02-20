@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use anyhow::{Error, Result};
 use crossbeam_channel::Receiver;
 
-use crate::{AxisIdent, AxisState, DPadState, Joystick, ObjectDiff};
+use crate::{AxisIdent, AxisState, DPadState, Joystick, ObjectDiff, SliderState};
 
 mod bits;
 pub mod rawinput;
@@ -14,16 +14,18 @@ pub struct StateDiff<B: Bits> {
     dpad: Option<DPadState>,
     buttons: (B, B),
     axis: [Option<AxisState>; AxisIdent::Limit as usize],
+    slider: Option<SliderState>,
 }
 
 impl<B: Bits> StateDiff<B> {
     pub fn diffs<const BN: usize, J: Joystick<BN>>(&self) -> Vec<ObjectDiff> {
         let axis_count = self.axis.iter().filter(|x| x.is_some()).count();
-        let mut obj_diffs = Vec::with_capacity(
-            self.buttons.0.count_ones() as usize
-                + axis_count
-                + self.dpad.as_ref().map(|_| 1usize).unwrap_or(0),
-        );
+        let obj_count = self.buttons.0.count_ones() as usize
+            + axis_count
+            + self.dpad.as_ref().into_iter().count()
+            + self.slider.as_ref().into_iter().count();
+
+        let mut obj_diffs = Vec::with_capacity(obj_count);
 
         if let Some(st) = self.dpad.as_ref().cloned() {
             obj_diffs.push(ObjectDiff::DPad(st));
@@ -48,12 +50,24 @@ impl<B: Bits> StateDiff<B> {
             }
         }
 
+        if let Some(st) = self.slider.as_ref().cloned() {
+            obj_diffs.push(ObjectDiff::Slider(st));
+        }
+
         obj_diffs
     }
 }
 
+pub struct DeviceInfo {
+    pub name: String,
+    pub buttons_num: usize,
+    pub dpad: bool,
+    pub axis: [Option<(i32, i32)>; AxisIdent::Limit as usize],
+    pub slider: Option<(i32, i32)>,
+}
+
 pub enum Event<DI: Debug + PartialEq, B: Bits> {
-    Attached(DI),
+    Attached(DI, DeviceInfo),
     Deattached(DI),
     StateDiff {
         id: DI,

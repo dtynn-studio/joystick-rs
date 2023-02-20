@@ -85,11 +85,14 @@ impl From<usize> for AxisIdent {
 
 pub type AxisState = i32;
 
+pub type SliderState = i32;
+
 #[derive(Debug)]
 pub enum ObjectDiff {
     DPad(DPadState),
     Button(Button, ButtonState),
     Axis(Axis, AxisState),
+    Slider(SliderState),
 }
 
 pub trait Joystick<const BTN_NUM: usize> {
