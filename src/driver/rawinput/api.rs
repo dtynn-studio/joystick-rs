@@ -1,4 +1,10 @@
-use std::{collections::HashMap, ffi::c_void, mem::size_of, time::SystemTime};
+use std::{
+    collections::HashMap,
+    ffi::c_void,
+    mem::{replace, size_of},
+    slice::from_raw_parts_mut,
+    time::SystemTime,
+};
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Sender;
@@ -36,7 +42,7 @@ use windows::{
 
 use super::ButtonBits;
 use crate::{
-    driver::{Bits, DeviceInfo},
+    driver::{Bits, DeviceInfo, StateDiff},
     AxisIdent, ButtonIdent, DPadState,
 };
 
@@ -147,7 +153,7 @@ enum DeviceObjectIndex {
     Slider,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct DeviceObjectStates {
     dpad: Option<DPadState>,
     buttons: ButtonBits,
@@ -155,19 +161,8 @@ struct DeviceObjectStates {
     slider: Option<i32>,
 }
 
-impl Default for DeviceObjectStates {
-    fn default() -> Self {
-        DeviceObjectStates {
-            dpad: None,
-            buttons: ButtonBits::default(),
-            axis: [None; 6],
-            slider: None,
-        }
-    }
-}
-
 struct DeviceStatus {
-    name: HSTRING,
+    _name: HSTRING,
     max_data_count: u32,
     pre_parsed_data: Vec<u8>,
     cap: DeviceCap,
@@ -201,7 +196,7 @@ pub(super) unsafe fn start_message_loop(hwnd: HWND, event_tx: &Sender<Event>) ->
                 return Ok(());
             }
 
-            WM_INPUT => process_input_message(&devices, msg.wParam, msg.lParam)
+            WM_INPUT => process_input_message(&mut devices, msg.wParam, msg.lParam)
                 .context("process input event"),
 
             WM_INPUT_DEVICE_CHANGE => {
@@ -298,7 +293,7 @@ unsafe fn get_device(hdl: HANDLE) -> Result<Option<(DeviceInfo, DeviceStatus)>> 
         ..Default::default()
     };
 
-    sys_get_device_info(hdl, RIDI_DEVICEINFO, &mut dev_info, None)?;
+    sys_get_device_info(hdl, RIDI_DEVICEINFO, &mut dev_info, None).context("get device info")?;
     if !is_hid_joystick(&dev_info) {
         warn!(
             dw = dev_info.dwType.0,
@@ -361,7 +356,7 @@ unsafe fn get_device(hdl: HANDLE) -> Result<Option<(DeviceInfo, DeviceStatus)>> 
     }
 
     let status = DeviceStatus {
-        name: hname,
+        _name: hname,
         max_data_count,
         pre_parsed_data,
         cap,
@@ -576,11 +571,172 @@ unsafe fn get_device_cap(pre_parsed_data_ptr: isize) -> Result<Option<DeviceCap>
 }
 
 unsafe fn process_input_message(
-    devices: &HashMap<isize, DeviceStatus>,
+    devices: &mut HashMap<isize, DeviceStatus>,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Result<Option<Event>> {
-    unimplemented!()
+    let is_sink = match wparam.0 as u32 {
+        RIM_INPUT => false,
+
+        RIM_INPUTSINK => true,
+
+        _other => {
+            warn!("unexpected wparam code");
+            return Ok(None);
+        }
+    };
+
+    get_input_event(devices, is_sink, lparam)
+}
+
+#[inline]
+unsafe fn get_raw_input_data(hdl: isize) -> Result<Vec<u8>> {
+    let mut raw_data_size = 0u32;
+    if GetRawInputData(
+        HRAWINPUT(hdl),
+        RID_INPUT,
+        None,
+        &mut raw_data_size,
+        size_of::<RAWINPUTHEADER>() as u32,
+    ) != 0
+    {
+        return Err(get_last_err()).context("get raw data size by calling GetRawInputData");
+    };
+
+    let mut raw_data = allocate_buffer::<u8>(raw_data_size as usize);
+    if GetRawInputData(
+        HRAWINPUT(hdl),
+        RID_INPUT,
+        Some(raw_data.as_mut_ptr() as *mut c_void),
+        &mut raw_data_size,
+        size_of::<RAWINPUTHEADER>() as u32,
+    ) == FAIL
+    {
+        return Err(get_last_err()).context("GetRawInputData");
+    };
+
+    Ok(raw_data)
+}
+
+#[inline]
+unsafe fn sys_hidp_get_data(
+    status: &DeviceStatus,
+    report_raw: &mut [u8],
+    data_buf: &mut [HIDP_DATA],
+) -> Result<u32> {
+    let mut data_len = data_buf.len() as u32;
+    HidP_GetData(
+        HidP_Input,
+        data_buf.as_mut_ptr(),
+        &mut data_len,
+        status.pre_parsed_data.as_ptr() as isize,
+        report_raw,
+    )?;
+
+    Ok(data_len)
+}
+
+#[inline]
+unsafe fn get_input_event(
+    devices: &mut HashMap<isize, DeviceStatus>,
+    is_sink: bool,
+    hdl: LPARAM,
+) -> Result<Option<Event>> {
+    let mut raw_data_bytes = get_raw_input_data(hdl.0)?;
+    let raw_data_ptr = raw_data_bytes.as_mut_ptr() as *mut RAWINPUT;
+    let raw_data = &mut *raw_data_ptr;
+
+    if raw_data.header.dwType != RIM_TYPEHID.0 {
+        return Ok(None);
+    }
+
+    let hdev = raw_data.header.hDevice.0;
+    let dev_status = devices
+        .get_mut(&hdev)
+        .ok_or_else(|| anyhow!("device info for {} not found", hdl.0))?;
+
+    let mut new_states = DeviceObjectStates::default();
+
+    let report_size = (raw_data.data.hid.dwCount * raw_data.data.hid.dwSizeHid) as usize;
+    let reports = from_raw_parts_mut(raw_data.data.hid.bRawData.as_mut_ptr(), report_size);
+
+    let mut data_buf = allocate_buffer::<HIDP_DATA>(dev_status.max_data_count as usize);
+
+    for (chunk_idx, chunk) in reports
+        .chunks_mut(raw_data.data.hid.dwSizeHid as usize)
+        .enumerate()
+    {
+        let data_count =
+            sys_hidp_get_data(dev_status, chunk, &mut data_buf).with_context(|| {
+                format!(
+                    "HidP_GetData for report chunk {}/{}",
+                    chunk_idx, raw_data.data.hid.dwCount
+                )
+            })?;
+
+        for data in data_buf.iter().take(data_count as usize) {
+            let obj_idx = match dev_status.cap.mapping.get(&data.DataIndex) {
+                Some(i) => i,
+                None => {
+                    trace!("object index not found for {}", data.DataIndex);
+                    continue;
+                }
+            };
+
+            let _data_value_span =
+                warn_span!("data value", data_idx = data.DataIndex, ?obj_idx).entered();
+
+            match obj_idx {
+                DeviceObjectIndex::DPad => {
+                    let st = match data.Anonymous.RawValue {
+                        0 => DPadState::Up,
+                        1 => DPadState::UpRight,
+                        2 => DPadState::Right,
+                        3 => DPadState::DownRight,
+                        4 => DPadState::Down,
+                        5 => DPadState::DownLeft,
+                        6 => DPadState::Left,
+                        7 => DPadState::UpLeft,
+                        _other => DPadState::Null,
+                    };
+
+                    new_states.dpad.replace(st);
+                }
+
+                DeviceObjectIndex::Button(idx) => {
+                    if data.Anonymous.On.as_bool() {
+                        new_states.buttons.set(*idx);
+                    }
+                }
+
+                DeviceObjectIndex::Axis(idx) => {
+                    if let Some(slot) = new_states.axis.get_mut(*idx as usize) {
+                        slot.replace(data.Anonymous.RawValue as i32);
+                    }
+                }
+
+                DeviceObjectIndex::Slider => {
+                    new_states.slider.replace(data.Anonymous.RawValue as i32);
+                }
+            }
+        }
+    }
+
+    let prev_state = replace(&mut dev_status.obj_states, new_states);
+    let btns_diff = dev_status.obj_states.buttons ^ prev_state.buttons;
+
+    let evt = Event::StateDiff {
+        id: hdev,
+        is_sink,
+        diff: StateDiff {
+            dpad: dev_status.obj_states.dpad,
+            buttons: (btns_diff, dev_status.obj_states.buttons),
+            axis: dev_status.obj_states.axis,
+            slider: dev_status.obj_states.slider,
+        },
+    };
+
+    Ok(Some(evt))
 }
 
 #[inline]
