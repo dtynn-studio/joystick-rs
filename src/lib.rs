@@ -26,6 +26,10 @@ pub enum Button {
     RShoulder,
     LTrigger,
     RTrigger,
+    North,
+    South,
+    East,
+    West,
     Other(&'static str),
 }
 
@@ -55,6 +59,7 @@ pub enum Axis {
     RThumbY,
     LTrigger,
     RTrigger,
+    Other(&'static str),
 }
 
 #[repr(usize)]
@@ -67,6 +72,13 @@ pub enum AxisIdent {
     RY = 4,
     RZ = 5,
     Limit = 6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AxisDef {
+    pub typ: Axis,
+    pub centered: bool,
+    // TODO: more definitions
 }
 
 impl From<usize> for AxisIdent {
@@ -98,5 +110,5 @@ pub enum ObjectDiff {
 pub trait Joystick<const BTN_NUM: usize> {
     const DPAD: bool;
     const BUTTONS: [Button; BTN_NUM];
-    const AXIS: [Option<(Axis, bool)>; AxisIdent::Limit as usize];
+    const AXIS: [Option<AxisDef>; AxisIdent::Limit as usize];
 }

@@ -18,7 +18,10 @@ pub struct StateDiff<B: Bits> {
 }
 
 impl<B: Bits> StateDiff<B> {
-    pub fn diffs<const BN: usize, J: Joystick<BN>>(&self) -> Vec<ObjectDiff> {
+    pub fn diffs<J, const N: usize>(&self, _joy: &J) -> Vec<ObjectDiff>
+    where
+        J: Joystick<N>,
+    {
         let axis_count = self.axis.iter().filter(|x| x.is_some()).count();
         let obj_count = self.buttons.0.count_ones() as usize
             + axis_count
@@ -46,7 +49,7 @@ impl<B: Bits> StateDiff<B> {
             .filter_map(|(i, x)| x.map(|prof| (i, prof)))
         {
             if let Some(st) = self.axis.get(idx).cloned().and_then(|x| x) {
-                obj_diffs.push(ObjectDiff::Axis(ax.0, st));
+                obj_diffs.push(ObjectDiff::Axis(ax.typ, st));
             }
         }
 
@@ -58,6 +61,7 @@ impl<B: Bits> StateDiff<B> {
     }
 }
 
+#[derive(Debug)]
 pub struct DeviceInfo {
     pub name: String,
     pub buttons_num: usize,

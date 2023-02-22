@@ -173,6 +173,8 @@ pub(super) unsafe fn start_message_loop(hwnd: HWND, event_tx: &Sender<Event>) ->
     register_events(hwnd).context("register events")?;
     debug!("register rawinput events");
 
+    let mut devices = HashMap::new();
+
     loop {
         trace!("waiting for message");
         let mut msg = MSG::default();
@@ -185,8 +187,6 @@ pub(super) unsafe fn start_message_loop(hwnd: HWND, event_tx: &Sender<Event>) ->
 
         let _span =
             warn_span!("message", code = msg.message, hwnd = ?msg.hwnd, wparam = ?msg.wParam, lparam = ?msg.lParam).entered();
-
-        let mut devices = HashMap::new();
 
         let event_res = match msg.message {
             WM_CLOSE => {
@@ -653,7 +653,7 @@ unsafe fn get_input_event(
     let hdev = raw_data.header.hDevice.0;
     let dev_status = devices
         .get_mut(&hdev)
-        .ok_or_else(|| anyhow!("device info for {} not found", hdl.0))?;
+        .ok_or_else(|| anyhow!("device info for {} not found", hdev))?;
 
     let mut new_states = DeviceObjectStates::default();
 
@@ -725,15 +725,33 @@ unsafe fn get_input_event(
     let prev_state = replace(&mut dev_status.obj_states, new_states);
     let btns_diff = dev_status.obj_states.buttons ^ prev_state.buttons;
 
+    let mut st_diff = StateDiff {
+        dpad: None,
+        buttons: (btns_diff, dev_status.obj_states.buttons),
+        axis: [None; AxisIdent::Limit as usize],
+        slider: None,
+    };
+
+    if dev_status.obj_states.dpad != prev_state.dpad {
+        st_diff.dpad = dev_status.obj_states.dpad;
+    }
+
+    if dev_status.obj_states.slider != prev_state.slider {
+        st_diff.slider = dev_status.obj_states.slider;
+    }
+
+    for (aidx, ast) in st_diff.axis.iter_mut().enumerate() {
+        if dev_status.obj_states.axis[aidx].is_some()
+            && dev_status.obj_states.axis[aidx] != prev_state.axis[aidx]
+        {
+            *ast = dev_status.obj_states.axis[aidx]
+        }
+    }
+
     let evt = Event::StateDiff {
         id: hdev,
         is_sink,
-        diff: StateDiff {
-            dpad: dev_status.obj_states.dpad,
-            buttons: (btns_diff, dev_status.obj_states.buttons),
-            axis: dev_status.obj_states.axis,
-            slider: dev_status.obj_states.slider,
-        },
+        diff: st_diff,
     };
 
     Ok(Some(evt))
