@@ -1,95 +1,92 @@
-use std::ops::RangeBounds;
+use std::fmt::Debug;
 
 use anyhow::{Error, Result};
 use crossbeam_channel::Receiver;
 
+use crate::{AxisIdent, AxisState, DPadState, Joystick, ObjectDiff, SliderState};
+
+mod bits;
 pub mod rawinput;
 
-pub trait Manager {
-    type DeviceIdent;
-    type Value;
-    type ValueRange: RangeBounds<Self::Value>;
+pub use bits::*;
 
-    fn as_event_receiver(
-        &self,
-    ) -> &Receiver<Result<Event<Self::DeviceIdent, Self::Value, Self::ValueRange>>>;
+pub struct StateDiff<B: Bits> {
+    dpad: Option<DPadState>,
+    buttons: (B, B),
+    axis: [Option<AxisState>; AxisIdent::Limit as usize],
+    slider: Option<SliderState>,
+}
 
-    fn close(self) -> Result<()>;
+impl<B: Bits> StateDiff<B> {
+    pub fn diffs<J, const N: usize>(&self, _joy: &J) -> Vec<ObjectDiff>
+    where
+        J: Joystick<N>,
+    {
+        let axis_count = self.axis.iter().filter(|x| x.is_some()).count();
+        let obj_count = self.buttons.0.count_ones() as usize
+            + axis_count
+            + self.dpad.as_ref().into_iter().count()
+            + self.slider.as_ref().into_iter().count();
+
+        let mut obj_diffs = Vec::with_capacity(obj_count);
+
+        if let Some(st) = self.dpad.as_ref().cloned() {
+            obj_diffs.push(ObjectDiff::DPad(st));
+        }
+
+        for (idx, ident) in J::BUTTONS.iter().enumerate() {
+            if let Some(true) = self.buttons.0.bit(idx) {
+                obj_diffs.push(ObjectDiff::Button(
+                    *ident,
+                    self.buttons.1.bit(idx).unwrap_or(false).into(),
+                ));
+            }
+        }
+
+        for (idx, ax) in J::AXIS
+            .iter()
+            .enumerate()
+            .filter_map(|(i, x)| x.map(|prof| (i, prof)))
+        {
+            if let Some(st) = self.axis.get(idx).cloned().and_then(|x| x) {
+                obj_diffs.push(ObjectDiff::Axis(ax.typ, st));
+            }
+        }
+
+        if let Some(st) = self.slider.as_ref().cloned() {
+            obj_diffs.push(ObjectDiff::Slider(st));
+        }
+
+        obj_diffs
+    }
 }
 
 #[derive(Debug)]
-pub enum Event<DI, V, VR> {
-    DeviceAttached(DI, DeviceInfo<VR>),
-    DeviceDeattached(DI),
-    DeviceState {
-        ident: DI,
-        is_sink: bool,
-        states: DeviceObjectStates<V>,
-    },
-    Warning(Error),
-    Interuption(Error),
-}
-
-#[derive(Debug)]
-pub struct DeviceInfo<VR> {
+pub struct DeviceInfo {
     pub name: String,
-    pub specs: DeviceSpecs<VR>,
+    pub buttons_num: usize,
+    pub dpad: bool,
+    pub axis: [Option<(i32, i32)>; AxisIdent::Limit as usize],
+    pub slider: Option<(i32, i32)>,
 }
 
-#[derive(Debug, Default)]
-pub struct DeviceSpecs<VR> {
-    pub button_count: usize,
-    pub axis: Vec<(AxisType, VR)>,
-    pub sliders: Vec<VR>,
-    pub hats_count: usize,
+pub enum Event<DI: Debug + PartialEq, B: Bits> {
+    Attached(DI, DeviceInfo),
+    Deattached(DI),
+    StateDiff {
+        id: DI,
+        is_sink: bool,
+        diff: StateDiff<B>,
+    },
+    Warn(Error),
+    Interruption(Result<()>),
 }
 
-#[derive(Debug)]
-pub struct DeviceObjectStates<V> {
-    pub buttons: Vec<ButtonState>,
-    pub axis: Vec<Option<V>>,
-    pub sliders: Vec<Option<V>>,
-    pub hats: Vec<HatState>,
-}
+pub trait Driver {
+    type DeviceIdent: Debug + PartialEq;
+    type ButtonBits: Bits;
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
-pub enum AxisType {
-    X,
-    Y,
-    Z,
-    RX,
-    RY,
-    RZ,
-}
+    fn as_event_receiver(&self) -> &Receiver<Event<Self::DeviceIdent, Self::ButtonBits>>;
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ButtonState {
-    Pressed = 1,
-    Releaed = 0,
-}
-
-impl Default for ButtonState {
-    fn default() -> Self {
-        Self::Releaed
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HatState {
-    Null,
-    Up,
-    Down,
-    Left,
-    Right,
-    UpLeft,
-    UpRight,
-    DownLeft,
-    DownRight,
-}
-
-impl Default for HatState {
-    fn default() -> Self {
-        Self::Null
-    }
+    fn close(self);
 }

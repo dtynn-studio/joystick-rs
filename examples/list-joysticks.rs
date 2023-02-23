@@ -1,70 +1,76 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use joystick_rs::{
-    driver::{
-        rawinput::{Config, DeviceType},
-        Event, HatState, Manager,
-    },
+    driver::{rawinput::RawInput, Driver, Event},
     logging::init_from_env,
+    profile::PS4Compact,
+    ObjectDiff,
 };
 
 pub fn main() -> Result<()> {
-    init_from_env()?;
+    init_from_env().context("init logging")?;
 
-    let cfg = Config {
-        dev_type: DeviceType::Both,
-        ..Default::default()
-    };
+    let hdl = RawInput::background().context("init rawinput in background")?;
 
-    let mgr = cfg.start()?;
-    info!("devices constructed");
+    let rx = hdl.as_event_receiver();
+    // let mut state_count = 0;
 
-    let rx = mgr.as_event_receiver();
-    let mut state_count = 0;
-
-    let mut btn_states = vec![];
-    let mut hat_state = HatState::default();
-
-    while let Ok(evt) = rx.recv()? {
+    loop {
+        let evt = rx.recv()?;
         match evt {
-            Event::DeviceAttached(id, info) => {
+            Event::Attached(id, info) => {
                 info!("device {} attached: {:?}", id, info);
             }
 
-            Event::DeviceDeattached(id) => {
+            Event::Deattached(id) => {
                 info!("device {} deattached", id);
                 break;
             }
 
-            Event::DeviceState {
-                ident,
-                is_sink,
-                states,
-            } => {
-                if states.buttons != btn_states {
-                    info!(prev = ?btn_states, next = ?states.buttons, "button states changed");
-                    btn_states = states.buttons;
-                }
+            Event::StateDiff { id, is_sink, diff } => {
+                let obj_diffs = diff.diffs(&PS4Compact);
+                // state_count += obj_diffs.len();
 
-                if let Some(st) = states.hats.first() {
-                    if st != &hat_state {
-                        info!(prev = ?hat_state, next = ?st, "hat state changed");
-                        hat_state = *st;
+                for odiff in obj_diffs {
+                    match odiff {
+                        ObjectDiff::Button(bid, bst) => {
+                            info!(dev = id, is_sink, "button state ({:?}, {:?})", bid, bst);
+                        }
+
+                        ObjectDiff::Axis(aid, ast) => {
+                            if ast == 0 || ast == 255 {
+                                info!(dev = id, is_sink, "axis edge state ({:?}, {:?})", aid, ast);
+                            }
+                        }
+
+                        ObjectDiff::DPad(dst) => {
+                            info!(dev = id, is_sink, "dpad state {:?}", dst);
+                        }
+
+                        _ => {}
                     }
                 }
 
-                state_count += 1;
+                // if state_count >= 1000 {
+                //     info!("a lot of state diffs");
+                //     break;
+                // }
             }
 
-            Event::Warning(e) | Event::Interuption(e) => {
+            Event::Warn(e) => {
                 warn!("err received: {:?}", e);
+                break;
+            }
+
+            Event::Interruption(res) => {
+                warn!("interrupted: {:?}", res);
                 break;
             }
         }
     }
 
-    _ = mgr.close();
+    hdl.close();
 
     info!("done");
 
